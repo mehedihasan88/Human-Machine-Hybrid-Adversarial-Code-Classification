@@ -623,7 +623,6 @@ training_args = TrainingArguments(
     warmup_ratio=WARMUP_RATIO,
     max_grad_norm=MAX_GRAD_NORM,
     logging_steps=LOGGING_STEPS,
-    eval_strategy="no",  # We'll do snippet-level eval manually
     save_total_limit=SAVE_TOTAL_LIMIT,
     load_best_model_at_end=False,  # Manual evaluation
     fp16=FP16,
