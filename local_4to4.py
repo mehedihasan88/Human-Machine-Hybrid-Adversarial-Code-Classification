@@ -45,15 +45,15 @@ warnings.filterwarnings("ignore")
 
 # Data / Subset
 USE_SUBSET = True
-SUBSET_TOTAL_N = 80_000         # REDUCED for local testing (was 200_000)
+SUBSET_TOTAL_N = 200_000         # REDUCED for local testing (was 200_000)
 SUBSET_SEED = 42
 BALANCE_BY_LANGUAGE = True
 BALANCE_BY_GENERATOR = False
 SAVE_SUBSET_PATH = "train_subset_4class.parquet"
 
 # Validation control
-USE_FULL_VALIDATION = False     # False for local testing to speed up
-VAL_DRY_RUN_MAX_N = 2_000       # Reduced for local testing
+USE_FULL_VALIDATION = True     # False for local testing to speed up
+VAL_DRY_RUN_MAX_N = 20_000       # Reduced for local testing
 VAL_SUBSET_SEED = 123
 
 # Labels (4-class direct)
@@ -65,18 +65,20 @@ NUM_LABELS = 4
 
 # Token / Cropping
 MAX_LENGTH = 512
-CROP_STRATEGY = "start_end"        # options: start_only | start_end | start_end_middle
+CROP_STRATEGY = "start_end_middle"        # options: start_only | start_end | start_end_middle
 MIDDLE_CROP_FOR = ["hybrid", "adversarial"]
 RANDOM_CROP_SEED = 123
 
 # Training
 MODEL_NAME = "microsoft/unixcoder-base"
-PER_DEVICE_TRAIN_BATCH = 4        # Reduced for local testing
-PER_DEVICE_EVAL_BATCH = 8         # Reduced for local testing
+# MODEL_NAME = "microsoft/codebert-base"  # Alternative option
+# MODEL_NAME = "Salesforce/codet5-base"   # If you want to experiment
+PER_DEVICE_TRAIN_BATCH = 8        # Reduced for local testing
+PER_DEVICE_EVAL_BATCH = 16         # Reduced for local testing
 GRAD_ACCUM = 2
-LR = 2e-5
-NUM_EPOCHS = 2                    # Keep 2 epochs for testing
-WARMUP_RATIO = 0.05
+LR = 1e-5
+NUM_EPOCHS = 3                    # Keep 2 epochs for testing
+WARMUP_RATIO = 0.1
 MAX_GRAD_NORM = 1.0
 FP16 = True if torch.cuda.is_available() else False
 
@@ -95,15 +97,15 @@ MISTAKES_N = 50                   # Reduced for local testing
 # Hard Negative Mining (ENABLED EVEN IN DRY RUN)
 DO_HARD_MINING = True
 HARD_MINING_AFTER_EPOCH = 1
-HARD_MINING_MIN_CONF = 0.60
+HARD_MINING_MIN_CONF = 0.65
 HARD_MINING_FOCUS_LABELS = [HYBRID_LABEL_ID, ADV_LABEL_ID]
 
 # Dynamic mining size (important) - LOCAL VERSION
-HARD_MINING_FRAC = 0.20           # fraction of subset to mine
-HARD_MINING_MAX_CAP = 2_000       # Reduced for local testing
+HARD_MINING_FRAC = 0.25           # fraction of subset to mine
+HARD_MINING_MAX_CAP = 20_000       # Reduced for local testing
 
 # Test prediction / submission - LOCAL VERSION
-GENERATE_SUBMISSION = False       # Disabled by default for local testing
+GENERATE_SUBMISSION = True       # Disabled by default for local testing
 TEST_PARQUET_PATH = "task_c_test_set_sample.parquet"  # Local test file
 SUBMISSION_OUTPUT_PATH = "submission.csv"  # Local output
 
