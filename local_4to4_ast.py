@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
-"""Task C: Hybrid Code Detection with Direct 4-Class Classification - Local Version
+"""Task C: Hybrid Code Detection with AST Enhancement - Local Version
 
 Core Strategy:
 - Train 4-class classifier directly (Human, Machine, Hybrid, Adversarial)
+- ENHANCED with AST features for language-agnostic classification
+- Handle unknown programming languages in test data using structural analysis
 - NO sliding-window inference
 - Handle long code via multi-view cropping (start / end / optional middle)
 - Improve rare classes using balanced subset sampling, focal loss, multi-view inference aggregation, and hard negative mining
+
+AST ENHANCEMENTS:
+- Language-agnostic AST feature extraction
+- Structural pattern analysis independent of programming language
+- Combined transformer + AST features for robust classification
+- Handles "Unknown" language in test data (84,571 samples)
 
 LOCAL VERSION MODIFICATIONS:
 - Removed Kaggle-specific paths
 - Updated data paths to use local files
 - Disabled submission generation by default
 - Added local file handling
+- Integrated AST feature extraction
 """
 
 import os
@@ -32,29 +41,36 @@ from sklearn.metrics import (
     accuracy_score, precision_recall_fscore_support, classification_report,
     confusion_matrix, f1_score)
 from sklearn.utils.class_weight import compute_class_weight
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 from tqdm import tqdm
 import warnings
 import json
 import time
 from collections import defaultdict
+import pickle
+
+# Import AST feature extractor
+from ast_feature_extractor import ASTFeatureExtractor
 
 warnings.filterwarnings("ignore")
 
 # ==================================================
-# SECTION A — CONFIG (LOCAL VERSION)
+# SECTION A — CONFIG (LOCAL VERSION WITH AST)
 # ==================================================
 
 # Data / Subset - ENABLED WITHOUT BALANCING
 USE_SUBSET = True
-SUBSET_TOTAL_N = 200_000         # Total samples for subset
+SUBSET_TOTAL_N = 80_000         # Total samples for subset
 SUBSET_SEED = 42
 BALANCE_BY_LANGUAGE = False      # Disable balancing
 BALANCE_BY_GENERATOR = False
-SAVE_SUBSET_PATH = "train_subset_4class.parquet"
+SAVE_SUBSET_PATH = "train_subset_4class_ast.parquet"
 
 # Validation control
-USE_FULL_VALIDATION = True     # False for local testing to speed up
-VAL_DRY_RUN_MAX_N = 20_000       # Reduced for local testing
+USE_FULL_VALIDATION = False     # False for local testing to speed up
+VAL_DRY_RUN_MAX_N = 20_00       # Reduced for local testing
 VAL_SUBSET_SEED = 123
 
 # Labels (4-class direct)
@@ -63,6 +79,11 @@ MACHINE_LABEL_ID = 1
 HYBRID_LABEL_ID = 2
 ADV_LABEL_ID = 3
 NUM_LABELS = 4
+
+# AST Configuration
+USE_AST_FEATURES = True
+AST_FEATURE_WEIGHT = 0.3        # Weight for AST features in final prediction
+COMBINE_METHOD = "ensemble"     # Options: "concatenate", "ensemble", "late_fusion"
 
 # Token / Cropping
 MAX_LENGTH = 512
@@ -74,6 +95,7 @@ RANDOM_CROP_SEED = 123
 MODEL_NAME = "microsoft/unixcoder-base"
 # MODEL_NAME = "microsoft/codebert-base"  # Alternative option
 # MODEL_NAME = "Salesforce/codet5-base"   # If you want to experiment
+
 PER_DEVICE_TRAIN_BATCH = 16        # Reduced for full dataset memory efficiency
 PER_DEVICE_EVAL_BATCH = 32         # Reduced for memory efficiency
 GRAD_ACCUM = 2                    # Increased to maintain effective batch size
@@ -120,15 +142,18 @@ HARD_MINING_MAX_CAP = 50_000       # Increased cap for full dataset
 # Test prediction / submission - LOCAL VERSION
 GENERATE_SUBMISSION = True       # Enable for full dataset testing
 TEST_PARQUET_PATH = "test.parquet"  # Use full test file
-SUBMISSION_OUTPUT_PATH = "submission.csv"  # Local output
+SUBMISSION_OUTPUT_PATH = "submission_ast.csv"  # Local output
 
 # Device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # ==================================================
-# SECTION B — DATA LOADING + TOKEN LENGTH STATS (LOCAL VERSION)
+# SECTION B — DATA LOADING + AST FEATURE EXTRACTION
 # ==================================================
+
+# Initialize AST feature extractor
+ast_extractor = ASTFeatureExtractor()
 
 # Check if local data files exist
 def check_local_files():
@@ -179,6 +204,19 @@ print(train_df["label"].value_counts().sort_index())
 print("\nValidation set:")
 print(val_df["label"].value_counts().sort_index())
 
+# Check language distribution
+if "language" in train_df.columns:
+    print("\nTraining language distribution:")
+    print(train_df["language"].value_counts())
+else:
+    print("\nNo language column in training data")
+
+if "language" in val_df.columns:
+    print("\nValidation language distribution:")
+    print(val_df["language"].value_counts())
+else:
+    print("\nNo language column in validation data")
+
 # Initialize tokenizer for length computation
 temp_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
 
@@ -200,6 +238,31 @@ def compute_token_lengths(df, tokenizer, batch_size=256):
     df = df.copy()
     df["tok_len"] = lengths
     return df
+
+def extract_ast_features_batch(df, batch_size=100):
+    """Extract AST features for a dataframe in batches."""
+    print("Extracting AST features...")
+    ast_features_list = []
+    
+    for i in tqdm(range(0, len(df), batch_size), desc="Extracting AST features"):
+        batch_df = df.iloc[i:i+batch_size]
+        batch_features = []
+        
+        for _, row in batch_df.iterrows():
+            code = row["code"]
+            language = row.get("language", None)
+            features = ast_extractor.extract_features(code, language)
+            batch_features.append(features)
+        
+        ast_features_list.extend(batch_features)
+    
+    # Convert to DataFrame
+    ast_features_df = pd.DataFrame(ast_features_list)
+    
+    # Add prefix to feature names
+    ast_features_df.columns = [f"ast_{col}" for col in ast_features_df.columns]
+    
+    return ast_features_df
 
 def make_validation_subset(val_df, max_n, seed):
     """
@@ -245,6 +308,27 @@ else:
     print("[LOCAL RUN] USING FULL VALIDATION SET")
     print("="*70)
     print(f"Validation samples used: {len(val_df)}")
+
+# Extract AST features if enabled
+if USE_AST_FEATURES:
+    print("\n" + "="*70)
+    print("EXTRACTING AST FEATURES")
+    print("="*70)
+    
+    # Extract AST features for training data
+    train_ast_features = extract_ast_features_batch(train_df)
+    print(f"Extracted {train_ast_features.shape[1]} AST features for training data")
+    
+    # Extract AST features for validation data
+    val_ast_features = extract_ast_features_batch(val_df)
+    print(f"Extracted {val_ast_features.shape[1]} AST features for validation data")
+    
+    # Save AST feature names for later use
+    ast_feature_names = train_ast_features.columns.tolist()
+    with open("ast_feature_names.pkl", "wb") as f:
+        pickle.dump(ast_feature_names, f)
+    
+    print(f"AST feature names saved to ast_feature_names.pkl")
 
 # Print statistics
 print("\n" + "="*70)
@@ -408,6 +492,7 @@ if USE_SUBSET:
     
     balancing_type = "with balancing" if (BALANCE_BY_LANGUAGE or BALANCE_BY_GENERATOR) else "without balancing"
     print(f"Creating subset of {SUBSET_TOTAL_N} samples {balancing_type}...")
+    
     train_df_subset = make_balanced_subset_4class(
         train_df, 
         SUBSET_TOTAL_N, 
@@ -441,6 +526,14 @@ if USE_SUBSET:
     print(f"\nSubset saved to {SAVE_SUBSET_PATH}")
     
     train_df = train_df_subset
+
+# Extract AST features for subset if needed
+if USE_AST_FEATURES and USE_SUBSET:
+    print("\n" + "="*70)
+    print("EXTRACTING AST FEATURES FOR SUBSET")
+    print("="*70)
+    train_ast_features = extract_ast_features_batch(train_df)
+    print(f"Extracted {train_ast_features.shape[1]} AST features for training subset")
 
 # ==================================================
 # SECTION D — MULTI-VIEW CROPPING (NO WINDOWS)
@@ -528,7 +621,7 @@ def tokenize_and_crop(df, tokenizer, max_length, crop_strategy="start_end", midd
     return pd.DataFrame(expanded_rows)
 
 # ==================================================
-# SECTION E — MODEL + TRAINER (4 CLASS)
+# SECTION E — MODEL + TRAINER (4 CLASS WITH AST)
 # ==================================================
 
 # Initialize tokenizer and model
@@ -596,6 +689,57 @@ data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
 print(f"\nTrain dataset size: {len(train_dataset)}")
 print(f"Validation dataset size: {len(val_dataset)}")
+
+# Train AST classifier if enabled
+ast_classifier = None
+ast_scaler = None
+
+if USE_AST_FEATURES:
+    print("\n" + "="*70)
+    print("TRAINING AST CLASSIFIER")
+    print("="*70)
+    
+    # Prepare AST features for training
+    if USE_SUBSET:
+        # Use subset AST features
+        X_train_ast = train_ast_features.values
+    else:
+        # Use full training AST features
+        X_train_ast = train_ast_features.values
+    
+    y_train_ast = train_df["label"].values
+    
+    # Prepare AST features for validation
+    X_val_ast = val_ast_features.values
+    y_val_ast = val_df["label"].values
+    
+    # Scale AST features
+    ast_scaler = StandardScaler()
+    X_train_ast_scaled = ast_scaler.fit_transform(X_train_ast)
+    X_val_ast_scaled = ast_scaler.transform(X_val_ast)
+    
+    # Train AST classifier
+    print("Training Random Forest on AST features...")
+    ast_classifier = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=10,
+        random_state=42,
+        n_jobs=-1
+    )
+    ast_classifier.fit(X_train_ast_scaled, y_train_ast)
+    
+    # Evaluate AST classifier
+    ast_val_pred = ast_classifier.predict(X_val_ast_scaled)
+    ast_val_f1 = f1_score(y_val_ast, ast_val_pred, average='macro')
+    print(f"AST Classifier Validation Macro F1: {ast_val_f1:.4f}")
+    
+    # Save AST components
+    with open("ast_classifier.pkl", "wb") as f:
+        pickle.dump(ast_classifier, f)
+    with open("ast_scaler.pkl", "wb") as f:
+        pickle.dump(ast_scaler, f)
+    
+    print("AST classifier and scaler saved")
 
 # Compute metrics function for early stopping
 def compute_metrics(eval_pred):
@@ -697,7 +841,8 @@ trainer = CustomTrainer(
     use_focal_loss=USE_FOCAL_LOSS,
     focal_gamma=FOCAL_GAMMA,
     use_class_weights=USE_CLASS_WEIGHTS,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=EARLY_STOPPING_PATIENCE)] if USE_EARLY_STOPPING else None)
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=EARLY_STOPPING_PATIENCE)] if USE_EARLY_STOPPING else None
+)
 
 print(f"\nTraining configuration:")
 print(f"  Focal loss: {USE_FOCAL_LOSS} (gamma={FOCAL_GAMMA})")
@@ -705,6 +850,11 @@ print(f"  Class weights: {USE_CLASS_WEIGHTS}")
 print(f"  FP16: {FP16}")
 print(f"  Effective batch size: {PER_DEVICE_TRAIN_BATCH * GRAD_ACCUM}")
 print(f"  Total epochs: {NUM_EPOCHS}")
+print(f"  AST features: {USE_AST_FEATURES}")
+if USE_AST_FEATURES:
+    print(f"  AST feature weight: {AST_FEATURE_WEIGHT}")
+    print(f"  Combination method: {COMBINE_METHOD}")
+
 if USE_EARLY_STOPPING:
     print(f"  Early stopping: ENABLED")
     print(f"    Patience: {EARLY_STOPPING_PATIENCE}")
@@ -720,7 +870,7 @@ else:
 
 # Train the model without early stopping
 print("\n" + "="*70)
-print("TRAINING WITHOUT EARLY STOPPING")
+print("TRAINING TRANSFORMER MODEL")
 print("="*70)
 trainer.train()
 trainer.save_model()
@@ -728,18 +878,46 @@ tokenizer.save_pretrained("./results")
 print("Training completed!")
 
 # ==================================================
-# SECTION F — MULTI-VIEW INFERENCE FUNCTIONS
+# SECTION F — MULTI-VIEW INFERENCE FUNCTIONS WITH AST
 # ==================================================
 
 @torch.no_grad()
-def predict_multiview(code, model, tokenizer, max_length, device):
+def predict_multiview_with_ast(code, model, tokenizer, ast_extractor, ast_classifier, ast_scaler, 
+                               max_length, device, use_ast=True, ast_weight=0.3):
     """
-    Run multi-view inference on a single code snippet.
+    Run multi-view inference on a single code snippet with AST features.
     
     For short code (tok_len <= MAX_LENGTH): single forward pass
     For long code (tok_len > MAX_LENGTH): start + end crops
     
-    Returns aggregated logits (4-class).
+    Returns aggregated logits (4-class) combining transformer and AST predictions.
+    """
+    # Transformer prediction
+    transformer_logits = predict_multiview_transformformer(code, model, tokenizer, max_length, device)
+    
+    if not use_ast or ast_classifier is None or ast_scaler is None:
+        return transformer_logits
+    
+    # AST prediction
+    try:
+        ast_features = ast_extractor.extract_features(code)
+        ast_feature_vector = np.array([ast_features[name] for name in ast_feature_names])
+        ast_feature_scaled = ast_scaler.transform([ast_feature_vector])
+        ast_probs = ast_classifier.predict_proba(ast_feature_scaled)[0]
+        ast_logits = torch.log(torch.tensor(ast_probs + 1e-8)).to(device)
+        
+        # Combine predictions
+        combined_logits = (1 - ast_weight) * transformer_logits + ast_weight * ast_logits
+        
+        return combined_logits
+    except Exception as e:
+        print(f"AST prediction failed: {e}")
+        return transformer_logits
+
+@torch.no_grad()
+def predict_multiview_transformformer(code, model, tokenizer, max_length, device):
+    """
+    Run multi-view transformer inference on a single code snippet.
     """
     # Tokenize without truncation
     tokens = tokenizer(code, add_special_tokens=False, truncation=False, return_tensors=None)
@@ -793,7 +971,6 @@ def predict_multiview(code, model, tokenizer, max_length, device):
 # Note: Hard negative mining is disabled when using early stopping
 # Early stopping provides automatic regularization and prevents overfitting
 # If you want to use hard negative mining, set USE_EARLY_STOPPING = False
-
 if not USE_EARLY_STOPPING and DO_HARD_MINING and NUM_EPOCHS > 1:
     print("\n" + "="*70)
     print("HARD NEGATIVE MINING (EARLY STOPPING DISABLED)")
@@ -808,12 +985,13 @@ else:
         print("Early stopping provides automatic regularization.")
 
 # ==================================================
-# SECTION H — MANUAL EVALUATION (MULTI-VIEW AWARE)
+# SECTION H — MANUAL EVALUATION (MULTI-VIEW + AST AWARE)
 # ==================================================
 
-def evaluate_4class_multiview(val_df, model, tokenizer, device, save_mistakes=True, mistakes_n=200):
+def evaluate_4class_multiview_ast(val_df, model, tokenizer, ast_extractor, ast_classifier, ast_scaler, 
+                                  device, save_mistakes=True, mistakes_n=200):
     """
-    Evaluate on validation set with multi-view inference aggregation.
+    Evaluate on validation set with multi-view inference and AST features.
     """
     model.eval()
     
@@ -824,7 +1002,7 @@ def evaluate_4class_multiview(val_df, model, tokenizer, device, save_mistakes=Tr
     start_time = time.time()
     
     print("\n" + "="*70)
-    print("RUNNING MULTI-VIEW INFERENCE ON VALIDATION SET")
+    print("RUNNING MULTI-VIEW + AST INFERENCE ON VALIDATION SET")
     print("="*70)
     
     for idx, row in tqdm(val_df.iterrows(), total=len(val_df), desc="Evaluating"):
@@ -832,8 +1010,11 @@ def evaluate_4class_multiview(val_df, model, tokenizer, device, save_mistakes=Tr
         true_label = row["label"]
         tok_len = row.get("tok_len", 0)
         
-        # Run multi-view inference
-        logits = predict_multiview(code, model, tokenizer, MAX_LENGTH, device)
+        # Run multi-view inference with AST
+        logits = predict_multiview_with_ast(
+            code, model, tokenizer, ast_extractor, ast_classifier, ast_scaler, 
+            MAX_LENGTH, device, USE_AST_FEATURES, AST_FEATURE_WEIGHT
+        )
         probs = torch.softmax(logits, dim=-1).cpu().numpy()
         pred_4class = int(np.argmax(probs))
         
@@ -880,7 +1061,7 @@ def evaluate_4class_multiview(val_df, model, tokenizer, device, save_mistakes=Tr
     
     # Print results
     print("\n" + "="*70)
-    print("SNIPPET-LEVEL EVALUATION RESULTS (4-CLASS)")
+    print("SNIPPET-LEVEL EVALUATION RESULTS (4-CLASS + AST)")
     print("="*70)
     print(f"\nMacro F1 (Primary): {macro_f1:.4f}")
     print(f"\nPer-class F1 Scores:")
@@ -938,8 +1119,8 @@ def evaluate_4class_multiview(val_df, model, tokenizer, device, save_mistakes=Tr
         
         if mistakes:
             mistakes_df = pd.DataFrame(mistakes[:mistakes_n])
-            mistakes_df.to_csv("validation_mistakes.csv", index=False)
-            print(f"\nSaved {len(mistakes_df)} hardest mistakes to validation_mistakes.csv")
+            mistakes_df.to_csv("validation_mistakes_ast.csv", index=False)
+            print(f"\nSaved {len(mistakes_df)} hardest mistakes to validation_mistakes_ast.csv")
     
     return {
         'macro_f1': macro_f1,
@@ -950,25 +1131,40 @@ def evaluate_4class_multiview(val_df, model, tokenizer, device, save_mistakes=Tr
         'all_stats': all_stats
     }
 
+# Load AST feature names if using AST
+if USE_AST_FEATURES:
+    try:
+        with open("ast_feature_names.pkl", "rb") as f:
+            ast_feature_names = pickle.load(f)
+        print(f"Loaded {len(ast_feature_names)} AST feature names")
+    except FileNotFoundError:
+        print("Warning: AST feature names not found, using empty list")
+        ast_feature_names = []
+
 # Run evaluation on validation set
 print("\n" + "="*70)
-print("FINAL VALIDATION EVALUATION")
+print("FINAL VALIDATION EVALUATION WITH AST")
 print("="*70)
-eval_results = evaluate_4class_multiview(
+eval_results = evaluate_4class_multiview_ast(
     val_df, 
     model, 
     tokenizer, 
+    ast_extractor, 
+    ast_classifier, 
+    ast_scaler,
     device,
     save_mistakes=SAVE_MISTAKES,
-    mistakes_n=MISTAKES_N)
+    mistakes_n=MISTAKES_N
+)
 
 # ==================================================
-# SECTION I — TEST PREDICTION + SUBMISSION (LOCAL VERSION)
+# SECTION I — TEST PREDICTION + SUBMISSION (LOCAL VERSION WITH AST)
 # ==================================================
 
-def predict_test_and_write_submission(test_parquet_path, output_csv_path, model, tokenizer, device):
+def predict_test_and_write_submission_ast(test_parquet_path, output_csv_path, model, tokenizer, 
+                                         ast_extractor, ast_classifier, ast_scaler, device):
     """
-    Stream test set, run multi-view inference, write 4-class predictions to submission.
+    Stream test set, run multi-view inference with AST, write 4-class predictions to submission.
     LOCAL VERSION: Uses local file paths
     """
     model.eval()
@@ -983,12 +1179,24 @@ def predict_test_and_write_submission(test_parquet_path, output_csv_path, model,
     try:
         test_df = pd.read_parquet(test_parquet_path)
         print(f"✅ Loaded test data: {len(test_df)} samples")
+        
+        # Check language distribution in test data
+        if "language" in test_df.columns:
+            print("\nTest language distribution:")
+            print(test_df["language"].value_counts())
+            
+            # Count unknown languages
+            unknown_count = (test_df["language"] == "Unknown").sum()
+            if unknown_count > 0:
+                print(f"\n⚠️  Found {unknown_count} samples with 'Unknown' language")
+                print("AST features will help classify these language-agnostic samples")
+        
     except Exception as e:
         print(f"❌ Error loading test file: {e}")
         return
     
     print("\n" + "="*70)
-    print("PREDICTING ON TEST SET")
+    print("PREDICTING ON TEST SET WITH AST FEATURES")
     print("="*70)
     
     with open(output_csv_path, "w") as f:
@@ -999,8 +1207,11 @@ def predict_test_and_write_submission(test_parquet_path, output_csv_path, model,
             code = row["code"]
             ex_id = row["ID"]
             
-            # Run multi-view inference
-            logits = predict_multiview(code, model, tokenizer, MAX_LENGTH, device)
+            # Run multi-view inference with AST
+            logits = predict_multiview_with_ast(
+                code, model, tokenizer, ast_extractor, ast_classifier, ast_scaler, 
+                MAX_LENGTH, device, USE_AST_FEATURES, AST_FEATURE_WEIGHT
+            )
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
             pred_4class = int(np.argmax(probs))
             
@@ -1023,23 +1234,29 @@ def predict_test_and_write_submission(test_parquet_path, output_csv_path, model,
         print(f"File: {output_csv_path}")
         print(f"Size: {file_size:.2f} MB")
         print(f"Total predictions: {count}")
+        print(f"AST features enabled: {USE_AST_FEATURES}")
+        if USE_AST_FEATURES:
+            print(f"AST feature weight: {AST_FEATURE_WEIGHT}")
         print("="*70)
     else:
         print(f"\n⚠️  WARNING: File {output_csv_path} was not created!")
 
 # Generate submission file on test set (if enabled)
 if GENERATE_SUBMISSION:
-    predict_test_and_write_submission(TEST_PARQUET_PATH, SUBMISSION_OUTPUT_PATH, model, tokenizer, device)
+    predict_test_and_write_submission_ast(
+        TEST_PARQUET_PATH, SUBMISSION_OUTPUT_PATH, model, tokenizer, 
+        ast_extractor, ast_classifier, ast_scaler, device
+    )
 else:
     print("\n" + "="*70)
     print("SUBMISSION GENERATION SKIPPED")
     print("="*70)
-    print("To generate submission.csv, set GENERATE_SUBMISSION = True in the config section")
+    print("To generate submission_ast.csv, set GENERATE_SUBMISSION = True in the config section")
     print(f"Test parquet path: {TEST_PARQUET_PATH}")
     print(f"Output path: {SUBMISSION_OUTPUT_PATH}")
 
 # ==================================================
-# SECTION J — FINAL RUN MODES (LOCAL VERSION)
+# SECTION J — FINAL RUN MODES (LOCAL VERSION WITH AST)
 # ==================================================
 
 ## LOCAL RUN MODE:
@@ -1047,32 +1264,46 @@ else:
 # - NUM_EPOCHS = 2
 # - HARD NEGATIVE MINING ENABLED (small scale: ~1000-2000 mined)
 # - VALIDATION LIMITED to 2_000 samples
+# - AST FEATURES ENABLED for language-agnostic classification
+# 
 # Goal:
-#   - Test the complete pipeline locally
-#   - Verify training and evaluation work
+#   - Test the complete pipeline locally with AST enhancement
+#   - Verify training and evaluation work with AST features
+#   - Handle unknown programming languages in test data
 #   - Debug any issues before full-scale run
-
+#
 ## To run with full data locally:
 # - Set SUBSET_TOTAL_N = 200_000 (or available data size)
 # - Set USE_FULL_VALIDATION = True
 # - Increase batch sizes if you have enough GPU memory
 # - Set GENERATE_SUBMISSION = True if you have test data
-
+#
 ## IMPORTANT LOCAL NOTES:
 # - Ensure you have the required parquet files in the current directory
 # - The script will check for required files before starting
 # - Model and results will be saved to "./results/" directory
-# - Validation mistakes will be saved to "validation_mistakes.csv"
+# - Validation mistakes will be saved to "validation_mistakes_ast.csv"
+# - AST components will be saved as pickle files
 # - All paths are relative to the current working directory
+#
+## AST ENHANCEMENT NOTES:
+# - AST features provide language-agnostic structural analysis
+# - Helps classify code from unknown programming languages
+# - Combined with transformer features for robust classification
+# - Particularly useful for the 84,571 "Unknown" language samples in test data
 
 print("\n" + "="*70)
-print("LOCAL EXECUTION COMPLETED")
+print("LOCAL EXECUTION WITH AST COMPLETED")
 print("="*70)
 print("Files created:")
 print("  - ./results/ (model checkpoints and tokenizer)")
-print("  - train_subset_4class.parquet (training subset)")
+print("  - train_subset_4class_ast.parquet (training subset)")
 if SAVE_MISTAKES:
-    print("  - validation_mistakes.csv (error analysis)")
+    print("  - validation_mistakes_ast.csv (error analysis)")
 if GENERATE_SUBMISSION:
-    print("  - submission.csv (test predictions)")
+    print("  - submission_ast.csv (test predictions with AST)")
+if USE_AST_FEATURES:
+    print("  - ast_classifier.pkl (trained AST classifier)")
+    print("  - ast_scaler.pkl (AST feature scaler)")
+    print("  - ast_feature_names.pkl (AST feature names)")
 print("="*70)

@@ -86,7 +86,7 @@ def main():
     
     # Load test data
     try:
-        test_df = pd.read_parquet('task_c_training_set_1.parquet')
+        test_df = pd.read_parquet('test.parquet')
         print(f"✅ Loaded test data: {len(test_df)} samples")
     except Exception as e:
         print(f"❌ Error loading test.parquet: {e}")
