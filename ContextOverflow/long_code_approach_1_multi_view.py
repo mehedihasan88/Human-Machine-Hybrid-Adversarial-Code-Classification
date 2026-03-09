@@ -32,6 +32,7 @@ from transformers import (
 from sklearn.metrics import (
     accuracy_score, precision_recall_fscore_support, classification_report,
     confusion_matrix, f1_score)
+from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 from tqdm import tqdm
 import warnings
@@ -45,20 +46,56 @@ warnings.filterwarnings("ignore")
 # SECTION A — CONFIG (LOCAL VERSION)
 # ==================================================
 
+# ---------------------------------------------------------------------------
+# RUN MODE: set RUN_ON_KAGGLE = True for Kaggle, False for local
+# ---------------------------------------------------------------------------
+RUN_ON_KAGGLE = False
+if RUN_ON_KAGGLE:
+    DATA_DIR = "/kaggle/input/competitions/sem-eval-2026-task-13-subtask-c/Task_C"
+    OUTPUT_DIR = "/kaggle/working"
+    TRAIN_FILE = "train.parquet"
+    VAL_FILE = "validation.parquet"
+    TEST_FILE = "test.parquet"
+else:
+    DATA_DIR = "."
+    OUTPUT_DIR = "."
+    TRAIN_FILE = "task_c_training_set_1.parquet"
+    VAL_FILE = "task_c_validation_set.parquet"
+    TEST_FILE = "test.parquet"
+RESULTS_DIR = os.path.join(OUTPUT_DIR, "results")
+
+# ---------------------------------------------------------------------------
+# QUICK TEST RUN: set QUICK_TEST = True for 2k train / 1k val / 1k test
+# For full run: QUICK_TEST = False (uses SUBSET_TOTAL_N, VAL_SIZE, TEST_SIZE below)
+# ---------------------------------------------------------------------------
+QUICK_TEST = True                # True = 2k train, 1k val, 1k test; False = use values below
+if QUICK_TEST:
+    _train_n = 2_000
+    _val_n = 1_000
+    _test_n = 1_000
+else:
+    _train_n = 200_000
+    _val_n = 40_000
+    _test_n = 40_000
+
 # Data / Subset - LENGTH-BASED BUCKET SAMPLING
 USE_SUBSET = True
-SUBSET_TOTAL_N = 200_000         # Total samples for subset
+SUBSET_TOTAL_N = _train_n       # Total samples for subset (2k for quick test, 200k full)
 SUBSET_SEED = 42                 # Random seed for reproducibility
 # Subset distribution:
 #   - 20% short snippets (<=512 tokens)
 #   - 80% long snippets (>512 tokens), evenly distributed across 512-token buckets
 #   - Buckets: [512, 1024), [1024, 1536), [1536, 2048), [2048, 2560), ...
-SAVE_SUBSET_PATH = "train_subset_4class.parquet"
+SAVE_SUBSET_PATH = os.path.join(OUTPUT_DIR, "train_subset_4class.parquet")
 
 # Validation control
-USE_FULL_VALIDATION = True     # False for local testing to speed up
-VAL_DRY_RUN_MAX_N = 20_000       # Reduced for local testing
+USE_FULL_VALIDATION = True     # Keep True so val/test use VAL_SIZE / TEST_SIZE (1k each when QUICK_TEST)
+VAL_DRY_RUN_MAX_N = 20_000       # Used only when USE_FULL_VALIDATION = False
 VAL_SUBSET_SEED = 123
+# Validation data split: val set and test set, same distribution as train (20% short, 80% long)
+VAL_SIZE = _val_n               # 1k for quick test, 40k full
+TEST_SIZE = _test_n             # 1k for quick test, 40k full
+VAL_TEST_SPLIT_SEED = 42
 
 # Labels (4-class direct)
 HUMAN_LABEL_ID = 0
@@ -120,59 +157,59 @@ HARD_MINING_LOW_CONF_THRESHOLD = 0.65  # Lowered for more comprehensive mining
 HARD_MINING_FRAC = 0.05           # Reduced fraction for full dataset
 HARD_MINING_MAX_CAP = 50_000       # Increased cap for full dataset
 
-# Test prediction / submission - LOCAL VERSION
+# Test prediction / submission (paths set from RUN_ON_KAGGLE above)
 GENERATE_SUBMISSION = True       # Enable for full dataset testing
-TEST_PARQUET_PATH = "test.parquet"  # Use full test file
-SUBMISSION_OUTPUT_PATH = "submission.csv"  # Local output
+TEST_PARQUET_PATH = os.path.join(DATA_DIR, TEST_FILE)
+SUBMISSION_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "submission.csv")
 
 # Device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
+print(f"[{'KAGGLE' if RUN_ON_KAGGLE else 'LOCAL'}] Data: {DATA_DIR}  |  Output: {OUTPUT_DIR}")
+if QUICK_TEST:
+    print(f"[QUICK TEST MODE] Train={_train_n:,}, Val={_val_n:,}, Test={_test_n:,}")
+else:
+    print(f"[FULL RUN] Train={_train_n:,}, Val={_val_n:,}, Test={_test_n:,}")
 
 # ==================================================
 # SECTION B — DATA LOADING + TOKEN LENGTH STATS (LOCAL VERSION)
 # ==================================================
 
-# Check if local data files exist
-def check_local_files():
-    """Check if required local data files exist."""
-    required_files = [
-        "task_c_training_set_1.parquet",
-        "task_c_validation_set.parquet"
-    ]
-    
-    missing_files = []
-    for file in required_files:
-        if not os.path.exists(file):
-            missing_files.append(file)
-    
-    if missing_files:
+# Check if required data files exist (in DATA_DIR)
+def check_data_files():
+    """Check if required data files exist in DATA_DIR."""
+    required_files = [TRAIN_FILE, VAL_FILE]
+    required_paths = [os.path.join(DATA_DIR, f) for f in required_files]
+    missing = [p for p in required_paths if not os.path.exists(p)]
+    if missing:
         print("❌ Missing required data files:")
-        for file in missing_files:
-            print(f"   - {file}")
-        print("\nPlease ensure the following files are in the current directory:")
-        for file in required_files:
-            print(f"   - {file}")
-        print("\nYou can download these from the competition dataset or use the sample files provided.")
+        for p in missing:
+            print(f"   - {p}")
+        print(f"\nExpected in: {DATA_DIR}")
         return False
-    
     print("✅ All required data files found!")
     return True
 
-# Check for local files
-if not check_local_files():
+# Check for required files
+if not check_data_files():
     print("\n⚠️  Exiting due to missing data files.")
-    exit(1)
+    if RUN_ON_KAGGLE and os.path.exists("/kaggle/input"):
+        _parent = os.path.dirname(DATA_DIR)
+        if os.path.exists(_parent):
+            print(f"Contents of {_parent}: {os.listdir(_parent)}")
+    raise SystemExit(1)
 
-# Load train and validation - LOCAL PATHS
+# Load train and validation
 try:
-    train_df = pd.read_parquet('task_c_training_set_1.parquet')
-    val_df = pd.read_parquet('task_c_validation_set.parquet')
-    print("✅ Successfully loaded local data files")
+    train_path = os.path.join(DATA_DIR, TRAIN_FILE)
+    val_path = os.path.join(DATA_DIR, VAL_FILE)
+    train_df = pd.read_parquet(train_path)
+    val_df = pd.read_parquet(val_path)
+    print(f"✅ Loaded train: {train_path}")
+    print(f"✅ Loaded validation: {val_path}")
 except Exception as e:
     print(f"❌ Error loading data files: {e}")
-    print("\nPlease ensure you have the correct parquet files in the current directory.")
-    exit(1)
+    raise SystemExit(1)
 
 print("="*70)
 print("ORIGINAL 4-CLASS DISTRIBUTIONS")
@@ -225,19 +262,178 @@ def make_validation_subset(val_df, max_n, seed):
     subset_df = pd.concat(subsets, ignore_index=True)
     return subset_df.sample(frac=1, random_state=seed).reset_index(drop=True)
 
+
+# Same ratio as train set: 20% short (<=512 tokens), 80% long (>512 tokens)
+# Long: same bucket structure as train — evenly across [512,1024), [1024,1536), ...
+VAL_TEST_SHORT_RATIO = 0.20
+VAL_TEST_LONG_RATIO = 0.80
+LONG_BUCKET_START = 512
+LONG_BUCKET_SIZE = 512
+
+
+def sample_long_with_buckets(long_df, long_target, seed, stratify_by_label=True):
+    """
+    Sample long_target rows from long_df using the same bucket logic as train:
+    - Buckets: [512, 1024), [1024, 1536), [1536, 2048), ...
+    - Distribute long_target evenly across non-empty buckets
+    - Within each bucket: sample up to bucket target (stratified by label if requested)
+    """
+    if len(long_df) == 0 or long_target <= 0:
+        return pd.DataFrame()
+    if len(long_df) <= long_target:
+        return long_df.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+    bucket_start = LONG_BUCKET_START
+    bucket_size = LONG_BUCKET_SIZE
+    max_tok_len = long_df["tok_len"].max()
+    num_buckets = max(1, int(np.ceil((max_tok_len - bucket_start) / bucket_size)))
+
+    long_buckets = []
+    for i in range(num_buckets):
+        low = bucket_start + i * bucket_size
+        high = bucket_start + (i + 1) * bucket_size
+        bucket_df = long_df[(long_df["tok_len"] >= low) & (long_df["tok_len"] < high)]
+        if len(bucket_df) > 0:
+            long_buckets.append({"range": (low, high), "df": bucket_df})
+
+    if not long_buckets:
+        return pd.DataFrame()
+
+    per_bucket_target = long_target // len(long_buckets)
+    remainder = long_target % len(long_buckets)
+    sampled_list = []
+    for i, info in enumerate(long_buckets):
+        bucket_df = info["df"]
+        bucket_target = per_bucket_target + (1 if i < remainder else 0)
+        n_take = min(bucket_target, len(bucket_df))
+        if n_take <= 0:
+            continue
+        if stratify_by_label:
+            sub = make_validation_subset(bucket_df, n_take, seed + i)
+        else:
+            sub = bucket_df.sample(n=n_take, random_state=seed + i)
+        sampled_list.append(sub)
+    if not sampled_list:
+        return pd.DataFrame()
+    return pd.concat(sampled_list, ignore_index=True)
+
+
+def split_validation_into_val_and_test(full_val_df, val_size, test_size, seed):
+    """
+    Split validation data into validation set (val_size) and test set (test_size).
+    Same type of logical ratio as the train set:
+    - 20% short (<=512 tokens), 80% long (>512 tokens) in each set
+    - Short: stratified by label
+    - Long: evenly distributed across 512-token buckets [512,1024), [1024,1536), ... (stratified by label within buckets)
+    """
+    np.random.seed(seed)
+    short_df = full_val_df[full_val_df["tok_len"] <= MAX_LENGTH].copy()
+    long_df = full_val_df[full_val_df["tok_len"] > MAX_LENGTH].copy()
+
+    short_per_set = int(val_size * VAL_TEST_SHORT_RATIO)   # 8k per set for 40k
+    long_per_set = val_size - short_per_set                 # 32k per set for 40k
+    short_total = short_per_set * 2
+    long_total = long_per_set * 2
+
+    print(f"Target distribution (same as train): {VAL_TEST_SHORT_RATIO*100:.0f}% short (<=512), {VAL_TEST_LONG_RATIO*100:.0f}% long (>512)")
+    print(f"  Long: evenly across 512-token buckets [512,1024), [1024,1536), ...")
+    print(f"  Per set: {short_per_set:,} short, {long_per_set:,} long")
+    print(f"  Available: {len(short_df):,} short, {len(long_df):,} long")
+
+    # If not enough short or long, use all available and adjust the other bucket so each set stays balanced
+    if len(short_df) < short_total:
+        print(f"  ⚠️  Using all {len(short_df):,} short (target was {short_total:,})")
+        short_total = len(short_df)
+        short_per_set = short_total // 2
+        long_per_set = val_size - short_per_set
+        long_total = long_per_set * 2
+    if len(long_df) < long_total:
+        print(f"  ⚠️  Using all {len(long_df):,} long (target was {long_total:,})")
+        long_total = len(long_df)
+        long_per_set = long_total // 2
+        short_per_set = min(val_size - long_per_set, short_total // 2) if short_total > 0 else 0
+        short_total = short_per_set * 2
+        if short_per_set * 2 > len(short_df):
+            short_per_set = len(short_df) // 2
+            short_total = short_per_set * 2
+
+    # Sample short: stratified by label, then split into val/test
+    if short_total > 0 and len(short_df) > 0:
+        short_sampled = make_validation_subset(short_df, short_total, seed)
+        val_short, test_short = train_test_split(
+            short_sampled,
+            test_size=short_per_set,
+            stratify=short_sampled["label"],
+            random_state=seed,
+            shuffle=True
+        )
+    else:
+        val_short = pd.DataFrame()
+        test_short = pd.DataFrame()
+
+    # Sample long: same bucket logic as train (even across 512-token buckets), stratified by label within buckets, then split into val/test
+    if long_total > 0 and len(long_df) > 0:
+        long_sampled = sample_long_with_buckets(long_df, long_total, seed + 1, stratify_by_label=True)
+        if len(long_sampled) > 0:
+            # If we got fewer than 2*long_per_set (e.g. sparse buckets), split in half; else give long_per_set to test
+            test_n = min(long_per_set, len(long_sampled) // 2) if len(long_sampled) < 2 * long_per_set else long_per_set
+            if len(long_sampled) < long_total:
+                print(f"  ⚠️  Long sampled {len(long_sampled):,} (target {long_total:,}); splitting for val/test")
+            val_long, test_long = train_test_split(
+                long_sampled,
+                test_size=test_n,
+                stratify=long_sampled["label"],
+                random_state=seed,
+                shuffle=True
+            )
+        else:
+            val_long = pd.DataFrame()
+            test_long = pd.DataFrame()
+    else:
+        val_long = pd.DataFrame()
+        test_long = pd.DataFrame()
+
+    val_df = pd.concat([val_short, val_long], ignore_index=True).sample(frac=1, random_state=seed).reset_index(drop=True)
+    test_df = pd.concat([test_short, test_long], ignore_index=True).sample(frac=1, random_state=seed + 1).reset_index(drop=True)
+
+    return val_df, test_df
+
 # Compute token lengths
 print("\n" + "="*70)
 print("COMPUTING TOKEN LENGTHS")
 print("="*70)
 train_df = compute_token_lengths(train_df, temp_tokenizer)
-val_df = compute_token_lengths(val_df, temp_tokenizer)
+print(f"Train set: {len(train_df):,} samples (tok_len computed)")
+val_full_df = compute_token_lengths(val_df.copy(), temp_tokenizer)
+print(f"Full validation (before split): {len(val_full_df):,} samples (tok_len computed)")
 
-# Apply validation subsetting (if needed)
+# Split validation data into validation set (40k) and test set (40k), same distribution as train
+print("\n" + "="*70)
+print("SPLITTING VALIDATION INTO VAL (40k) AND TEST (40k)")
+print("="*70)
+val_df, test_df = split_validation_into_val_and_test(
+    val_full_df, VAL_SIZE, TEST_SIZE, VAL_TEST_SPLIT_SEED
+)
+print(f"Validation set: {len(val_df):,} samples")
+print(f"Test set: {len(test_df):,} samples")
+for name, df in [("Validation", val_df), ("Test", test_df)]:
+    if len(df) > 0:
+        n_short = (df["tok_len"] <= MAX_LENGTH).sum()
+        n_long = (df["tok_len"] > MAX_LENGTH).sum()
+        pct_s = n_short / len(df) * 100
+        pct_l = n_long / len(df) * 100
+        print(f"  {name}: {n_short:,} short ({pct_s:.1f}%), {n_long:,} long ({pct_l:.1f}%) [target 20%/80%]")
+print("\nValidation set label distribution (should match train):")
+print(val_df["label"].value_counts().sort_index())
+print("\nTest set label distribution (should match train):")
+print(test_df["label"].value_counts().sort_index())
+
+# Apply validation subsetting (if needed, for local quick runs)
 if not USE_FULL_VALIDATION:
     print("\n" + "="*70)
     print("[LOCAL RUN] LIMITING VALIDATION SET")
     print("="*70)
-    print(f"Original validation size: {len(val_df)}")
+    print(f"Validation size before cap: {len(val_df)}")
     print(f"Capping at {VAL_DRY_RUN_MAX_N} samples (stratified by label)")
     val_df = make_validation_subset(val_df, VAL_DRY_RUN_MAX_N, VAL_SUBSET_SEED)
     print(f"Validation samples used: {len(val_df)}")
@@ -245,7 +441,7 @@ if not USE_FULL_VALIDATION:
     print(val_df["label"].value_counts().sort_index())
 else:
     print("\n" + "="*70)
-    print("[LOCAL RUN] USING FULL VALIDATION SET")
+    print("[LOCAL RUN] USING FULL VALIDATION SET (40k)")
     print("="*70)
     print(f"Validation samples used: {len(val_df)}")
 
@@ -263,11 +459,30 @@ if "language" in train_df.columns:
     print("\nLanguage distribution (training):")
     print(train_df["language"].value_counts().head(10))
 
-# % of samples with tok_len > MAX_LENGTH
-pct_long_train = (train_df["tok_len"] > MAX_LENGTH).sum() / len(train_df) * 100
-pct_long_val = (val_df["tok_len"] > MAX_LENGTH).sum() / len(val_df) * 100
-print(f"\n% of samples with tok_len > {MAX_LENGTH} (training): {pct_long_train:.2f}%")
-print(f"% of samples with tok_len > {MAX_LENGTH} (validation): {pct_long_val:.2f}%")
+# Short/long ratio (target 20% short, 80% long for all sets)
+# Note: train_df here is still full train; subset is created in Section C below
+n_short_train = (train_df["tok_len"] <= MAX_LENGTH).sum()
+n_long_train = (train_df["tok_len"] > MAX_LENGTH).sum()
+pct_short_train = n_short_train / len(train_df) * 100
+pct_long_train = n_long_train / len(train_df) * 100
+n_short_val = (val_df["tok_len"] <= MAX_LENGTH).sum()
+n_long_val = (val_df["tok_len"] > MAX_LENGTH).sum()
+pct_short_val = n_short_val / len(val_df) * 100
+pct_long_val = n_long_val / len(val_df) * 100
+n_short_test = (test_df["tok_len"] <= MAX_LENGTH).sum()
+n_long_test = (test_df["tok_len"] > MAX_LENGTH).sum()
+pct_short_test = n_short_test / len(test_df) * 100
+pct_long_test = n_long_test / len(test_df) * 100
+
+print("\n" + "-"*70)
+print("TRAIN / VALIDATION / TEST — LENGTH RATIO CHECK (target 20% short, 80% long)")
+print("-"*70)
+print(f"  {'Set':<12} {'Total':>10} {'Short':>10} {'Long':>10} {'Short%':>8} {'Long%':>8}")
+print(f"  {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*8} {'-'*8}")
+print(f"  {'Train':<12} {len(train_df):>10,} {n_short_train:>10,} {n_long_train:>10,} {pct_short_train:>7.1f}% {pct_long_train:>7.1f}%  (full train; subset below)")
+print(f"  {'Validation':<12} {len(val_df):>10,} {n_short_val:>10,} {n_long_val:>10,} {pct_short_val:>7.1f}% {pct_long_val:>7.1f}%")
+print(f"  {'Test':<12} {len(test_df):>10,} {n_short_test:>10,} {n_long_test:>10,} {pct_short_test:>7.1f}% {pct_long_test:>7.1f}%")
+print("-"*70)
 
 # Stats specifically for Hybrid and Adversarial
 for label_id, label_name in [(HYBRID_LABEL_ID, "Hybrid"), (ADV_LABEL_ID, "Adversarial")]:
@@ -457,6 +672,21 @@ if USE_SUBSET:
     print(f"\nSubset saved to {SAVE_SUBSET_PATH}")
     
     train_df = train_df_subset
+
+# Final summary: train, validation, test — sizes, ratios, label distributions (always print)
+print("\n" + "="*70)
+print("FINAL TRAIN / VALIDATION / TEST SUMMARY (for ratio verification)")
+print("="*70)
+train_label = "TRAIN (subset)" if USE_SUBSET else "TRAIN (full)"
+for set_name, df in [(train_label, train_df), ("VALIDATION", val_df), ("TEST", test_df)]:
+    n = len(df)
+    ns = (df["tok_len"] <= MAX_LENGTH).sum()
+    nl = (df["tok_len"] > MAX_LENGTH).sum()
+    ps = ns / n * 100 if n else 0
+    pl = nl / n * 100 if n else 0
+    print(f"\n{set_name}: total={n:,}  |  short={ns:,} ({ps:.1f}%)  |  long={nl:,} ({pl:.1f}%)  [target 20%/80%]")
+    print(f"  Label distribution: {dict(df['label'].value_counts().sort_index())}")
+print("\n" + "="*70)
 
 # ==================================================
 # SECTION D — MULTI-VIEW CROPPING (NO WINDOWS)
@@ -694,7 +924,7 @@ class CustomTrainer(Trainer):
 
 # Training arguments with early stopping support
 training_args_epoch1 = TrainingArguments(
-    output_dir="./results",
+    output_dir=RESULTS_DIR,
     num_train_epochs=NUM_EPOCHS,  # Train for full epochs with early stopping
     per_device_train_batch_size=PER_DEVICE_TRAIN_BATCH,
     per_device_eval_batch_size=PER_DEVICE_EVAL_BATCH,
@@ -703,7 +933,7 @@ training_args_epoch1 = TrainingArguments(
     warmup_ratio=WARMUP_RATIO,
     max_grad_norm=MAX_GRAD_NORM,
     logging_steps=LOGGING_STEPS,
-    evaluation_strategy=EVAL_STRATEGY if USE_EARLY_STOPPING else "no",
+    eval_strategy=EVAL_STRATEGY if USE_EARLY_STOPPING else "no",
     eval_steps=EVAL_STEPS if USE_EARLY_STOPPING else None,
     save_strategy="epoch" if USE_EARLY_STOPPING else "steps",  # Match evaluation strategy
     save_total_limit=SAVE_TOTAL_LIMIT,
@@ -773,7 +1003,7 @@ training_end_time = time.time()
 total_training_time = training_end_time - training_start_time
 
 trainer.save_model()
-tokenizer.save_pretrained("./results")
+tokenizer.save_pretrained(RESULTS_DIR)
 
 # Report training time statistics
 print("\n" + "="*70)
@@ -881,9 +1111,10 @@ else:
 # SECTION H — MANUAL EVALUATION (MULTI-VIEW AWARE)
 # ==================================================
 
-def evaluate_4class_multiview(val_df, model, tokenizer, device, save_mistakes=True, mistakes_n=200):
+def evaluate_4class_multiview(val_df, model, tokenizer, device, save_mistakes=True, mistakes_n=200, mistakes_csv_path=None):
     """
     Evaluate on validation set with multi-view inference aggregation.
+    mistakes_csv_path: if save_mistakes is True, write mistakes here; default "validation_mistakes.csv".
     """
     model.eval()
     
@@ -1056,29 +1287,49 @@ def evaluate_4class_multiview(val_df, model, tokenizer, device, save_mistakes=Tr
         
         if mistakes:
             mistakes_df = pd.DataFrame(mistakes[:mistakes_n])
-            mistakes_df.to_csv("validation_mistakes.csv", index=False)
-            print(f"\nSaved {len(mistakes_df)} hardest mistakes to validation_mistakes.csv")
-    
+            out_path = mistakes_csv_path if mistakes_csv_path is not None else os.path.join(OUTPUT_DIR, "validation_mistakes.csv")
+            mistakes_df.to_csv(out_path, index=False)
+            print(f"\nSaved {len(mistakes_df)} hardest mistakes to {out_path}")
+        else:
+            mistakes_df = None
+    else:
+        mistakes_df = None
+
     return {
         'macro_f1': macro_f1,
         'per_class_f1': dict(zip(unique_labels, per_class_f1)),
         'confusion_matrix': cm,
         'predictions': predictions_4class,
         'true_labels': true_labels,
-        'all_stats': all_stats
+        'all_stats': all_stats,
+        'mistakes_df': mistakes_df if save_mistakes else None
     }
 
-# Run evaluation on validation set
+# Run evaluation on validation set (40k)
 print("\n" + "="*70)
-print("FINAL VALIDATION EVALUATION")
+print("FINAL VALIDATION EVALUATION (40k)")
 print("="*70)
 eval_results = evaluate_4class_multiview(
-    val_df, 
-    model, 
-    tokenizer, 
+    val_df,
+    model,
+    tokenizer,
     device,
     save_mistakes=SAVE_MISTAKES,
-    mistakes_n=MISTAKES_N)
+    mistakes_n=MISTAKES_N,
+    mistakes_csv_path=os.path.join(OUTPUT_DIR, "validation_mistakes.csv"))
+
+# Run evaluation on held-out test set (40k), same distribution as train
+print("\n" + "="*70)
+print("FINAL TEST SET EVALUATION (40k)")
+print("="*70)
+evaluate_4class_multiview(
+    test_df,
+    model,
+    tokenizer,
+    device,
+    save_mistakes=SAVE_MISTAKES,
+    mistakes_n=MISTAKES_N,
+    mistakes_csv_path=os.path.join(OUTPUT_DIR, "test_mistakes.csv"))
 
 # ==================================================
 # SECTION I — TEST PREDICTION + SUBMISSION (LOCAL VERSION)
@@ -1179,18 +1430,19 @@ else:
 ## IMPORTANT LOCAL NOTES:
 # - Ensure you have the required parquet files in the current directory
 # - The script will check for required files before starting
-# - Model and results will be saved to "./results/" directory
-# - Validation mistakes will be saved to "validation_mistakes.csv"
+# - Model and results: RESULTS_DIR (./results locally, /kaggle/working/results on Kaggle)
+# - Mistakes and submission: OUTPUT_DIR
 # - All paths are relative to the current working directory
 
 print("\n" + "="*70)
 print("LOCAL EXECUTION COMPLETED")
 print("="*70)
 print("Files created:")
-print("  - ./results/ (model checkpoints and tokenizer)")
-print("  - train_subset_4class.parquet (training subset)")
+print(f"  - {RESULTS_DIR}/ (model checkpoints and tokenizer)")
+print(f"  - {SAVE_SUBSET_PATH} (training subset)")
 if SAVE_MISTAKES:
-    print("  - validation_mistakes.csv (error analysis)")
+    print(f"  - {os.path.join(OUTPUT_DIR, 'validation_mistakes.csv')} (validation error analysis)")
+    print(f"  - {os.path.join(OUTPUT_DIR, 'test_mistakes.csv')} (test set error analysis)")
 if GENERATE_SUBMISSION:
-    print("  - submission.csv (test predictions)")
+    print(f"  - {SUBMISSION_OUTPUT_PATH} (test predictions)")
 print("="*70)
