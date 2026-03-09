@@ -68,7 +68,7 @@ RESULTS_DIR = os.path.join(OUTPUT_DIR, "results")
 # QUICK TEST RUN: set QUICK_TEST = True for 2k train / 1k val / 1k test
 # For full run: QUICK_TEST = False (uses SUBSET_TOTAL_N, VAL_SIZE, TEST_SIZE below)
 # ---------------------------------------------------------------------------
-QUICK_TEST = True                # True = 2k train, 1k val, 1k test; False = use values below
+QUICK_TEST = False                # True = 2k train, 1k val, 1k test; False = use values below
 if QUICK_TEST:
     _train_n = 2_000
     _val_n = 1_000
@@ -158,7 +158,7 @@ HARD_MINING_FRAC = 0.05           # Reduced fraction for full dataset
 HARD_MINING_MAX_CAP = 50_000       # Increased cap for full dataset
 
 # Test prediction / submission (paths set from RUN_ON_KAGGLE above)
-GENERATE_SUBMISSION = True       # Enable for full dataset testing
+GENERATE_SUBMISSION = False       # Enable for full dataset testing
 TEST_PARQUET_PATH = os.path.join(DATA_DIR, TEST_FILE)
 SUBMISSION_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "submission.csv")
 
@@ -407,9 +407,9 @@ print(f"Train set: {len(train_df):,} samples (tok_len computed)")
 val_full_df = compute_token_lengths(val_df.copy(), temp_tokenizer)
 print(f"Full validation (before split): {len(val_full_df):,} samples (tok_len computed)")
 
-# Split validation data into validation set (40k) and test set (40k), same distribution as train
+# Split validation data into validation set and test set, same distribution as train
 print("\n" + "="*70)
-print("SPLITTING VALIDATION INTO VAL (40k) AND TEST (40k)")
+print(f"SPLITTING VALIDATION INTO VAL ({VAL_SIZE:,}) AND TEST ({TEST_SIZE:,})")
 print("="*70)
 val_df, test_df = split_validation_into_val_and_test(
     val_full_df, VAL_SIZE, TEST_SIZE, VAL_TEST_SPLIT_SEED
@@ -441,9 +441,9 @@ if not USE_FULL_VALIDATION:
     print(val_df["label"].value_counts().sort_index())
 else:
     print("\n" + "="*70)
-    print("[LOCAL RUN] USING FULL VALIDATION SET (40k)")
+    print(f"[LOCAL RUN] USING FULL VALIDATION SET ({len(val_df):,} samples)")
     print("="*70)
-    print(f"Validation samples used: {len(val_df)}")
+    print(f"Validation samples used: {len(val_df):,}")
 
 # Print statistics
 print("\n" + "="*70)
@@ -884,7 +884,11 @@ class EpochTimeCallback(TrainerCallback):
 # Custom Trainer with focal/weighted loss
 class CustomTrainer(Trainer):
     def __init__(self, class_weights=None, use_focal_loss=False, focal_gamma=2.0, use_class_weights=True, *args, **kwargs):
+        # Newer transformers may not accept tokenizer; pop and set on self for save_model
+        self._custom_tokenizer = kwargs.pop("tokenizer", None)
         super().__init__(*args, **kwargs)
+        if self._custom_tokenizer is not None:
+            self.tokenizer = self._custom_tokenizer
         self.class_weights = class_weights
         self.use_focal_loss = use_focal_loss
         self.focal_gamma = focal_gamma
@@ -1305,9 +1309,9 @@ def evaluate_4class_multiview(val_df, model, tokenizer, device, save_mistakes=Tr
         'mistakes_df': mistakes_df if save_mistakes else None
     }
 
-# Run evaluation on validation set (40k)
+# Run evaluation on validation set
 print("\n" + "="*70)
-print("FINAL VALIDATION EVALUATION (40k)")
+print(f"FINAL VALIDATION EVALUATION ({len(val_df):,} samples)")
 print("="*70)
 eval_results = evaluate_4class_multiview(
     val_df,
@@ -1318,9 +1322,9 @@ eval_results = evaluate_4class_multiview(
     mistakes_n=MISTAKES_N,
     mistakes_csv_path=os.path.join(OUTPUT_DIR, "validation_mistakes.csv"))
 
-# Run evaluation on held-out test set (40k), same distribution as train
+# Run evaluation on held-out test set (same distribution as train)
 print("\n" + "="*70)
-print("FINAL TEST SET EVALUATION (40k)")
+print(f"FINAL TEST SET EVALUATION ({len(test_df):,} samples)")
 print("="*70)
 evaluate_4class_multiview(
     test_df,
