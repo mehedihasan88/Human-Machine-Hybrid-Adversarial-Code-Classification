@@ -1,0 +1,54 @@
+# Large dataset files
+*.parquet
+task_c_*.parquet
+test_*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Results
+# Exclude specific result files that should be committed
+!results/test_inference_sliding_window.csv
+!results/validation_inference_sliding_window.csv
+!results/test_inference_basic.csv
+!results/test_inference_multiview.csv
+!results/validation_inference_multiview.csv
+!results/validation_inference.csv
+!results/submission1.csv
+
+# Ignore other result files
+results/*.parquet
+
+# Data files
+*.pkl
+*.h5
+*.hdf5
