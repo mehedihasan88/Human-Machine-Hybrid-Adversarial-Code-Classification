@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Task C: Hybrid Code Detection with Direct 4-Class Classification - Local Version
+(long_code_approach_2_sliding_window)
 
 Core Strategy:
 - Train 4-class classifier directly (Human, Machine, Hybrid, Adversarial)
-- NO sliding-window inference
-- Handle long code via multi-view cropping (start / end / optional middle)
-- Improve rare classes using balanced subset sampling, focal loss, multi-view inference aggregation, and hard negative mining
+- Handle long code via SLIDING-WINDOW training and inference (overlapping windows, pooling)
+- Improve rare classes using balanced subset sampling, focal loss, sliding-window aggregation, and hard negative mining
 
 LOCAL VERSION MODIFICATIONS:
 - Removed Kaggle-specific paths
@@ -104,11 +104,24 @@ HYBRID_LABEL_ID = 2
 ADV_LABEL_ID = 3
 NUM_LABELS = 4
 
-# Token 
+# Token / sequence length (MAX_LENGTH kept for compatibility; windows use WINDOW_SIZE)
 MAX_LENGTH = 512
-CROP_STRATEGY = "start_end_middle"        # options: start_only | start_end | start_end_middle
-MIDDLE_CROP_FOR = ["hybrid", "adversarial"]
-RANDOM_CROP_SEED = 123
+
+# Sliding-window settings
+WINDOW_SIZE = 512
+WINDOW_STRIDE = 256
+TRAIN_WINDOW_MODE = "all"        # options: "all", "capped", "random_sample"
+MAX_TRAIN_WINDOWS_PER_SAMPLE = 8  # only used if TRAIN_WINDOW_MODE == "capped"
+MAX_INFER_WINDOWS_PER_SAMPLE = None  # None = use all windows
+
+# Pooling settings (snippet-level from window logits)
+POOLING_MODE = "mean_with_adv_max"   # allowed: "mean", "max", "mean_with_adv_max"
+
+# Optional speed control (gated inference)
+USE_GATED_INFERENCE = False
+GATE_CONF_THRESHOLD = 0.80
+GATE_TRIGGER_LABELS = [2, 3]         # Hybrid / Adversarial
+GATE_TRIGGER_LONG_ONLY = True        # only gate long code
 
 # Training - OPTIMIZED FOR FULL DATASET
 MODEL_NAME = "microsoft/unixcoder-base"
@@ -118,7 +131,7 @@ PER_DEVICE_TRAIN_BATCH = 16        # Reduced for full dataset memory efficiency
 PER_DEVICE_EVAL_BATCH = 32         # Reduced for memory efficiency
 GRAD_ACCUM = 2                    # Increased to maintain effective batch size
 LR = 2e-5                         # Slightly higher for full dataset
-NUM_EPOCHS = 1                    # Reduced for full dataset training time
+NUM_EPOCHS = 2                    # Reduced for full dataset training time
 WARMUP_RATIO = 0.2
 MAX_GRAD_NORM = 1.0
 FP16 = True if torch.cuda.is_available() else False
@@ -134,7 +147,7 @@ SAVE_TOTAL_LIMIT = 2
 REPORT_LENGTH_BUCKETS = True
 SAVE_MISTAKES = True
 MISTAKES_N = 50                   # Reduced for local testing
-SAVE_INFERENCE = True             # Save all inference results to CSV
+SAVE_INFERENCE = True 
 
 # Early Stopping Configuration - DISABLED
 USE_EARLY_STOPPING = False        # Disable early stopping
@@ -162,6 +175,8 @@ HARD_MINING_MAX_CAP = 50_000       # Increased cap for full dataset
 GENERATE_SUBMISSION = False       # Enable for full dataset testing
 TEST_PARQUET_PATH = os.path.join(DATA_DIR, TEST_FILE)
 SUBMISSION_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "submission.csv")
+# In QUICK_TEST mode, cap test prediction to this many samples (None = no cap)
+TEST_PREDICT_MAX_SAMPLES = 2_000 if QUICK_TEST else None
 
 # Device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -690,89 +705,94 @@ for set_name, df in [(train_label, train_df), ("VALIDATION", val_df), ("TEST", t
 print("\n" + "="*70)
 
 # ==================================================
-# SECTION D — MULTI-VIEW CROPPING (NO WINDOWS)
+# SECTION D — SLIDING-WINDOW GENERATION AND TRAINING EXPANSION
 # ==================================================
 
-def tokenize_and_crop(df, tokenizer, max_length, crop_strategy="start_end", middle_crop_for=None):
+def generate_sliding_windows(code, tokenizer, window_size=512, stride=256, max_windows=None):
     """
-    Apply multi-view cropping to create training rows.
-    
-    If tok_len <= MAX_LENGTH: single view
-    If tok_len > MAX_LENGTH:
-        - start crop (first MAX_LENGTH tokens)
-        - end crop (last MAX_LENGTH tokens)
-        - optional middle crop ONLY for specified labels if crop_strategy == start_end_middle
-    Each crop becomes its own training row with metadata.
+    Tokenize code without truncation and split into overlapping windows.
+    Returns: (list of window input_ids with special tokens, original token length).
+    [CLS] + chunk + [SEP] so total length <= window_size; chunk length = effective_window_size = window_size - 2.
     """
-    if middle_crop_for is None:
-        middle_crop_for = []
-    
+    cls_id = tokenizer.cls_token_id
+    sep_id = tokenizer.sep_token_id
+    if cls_id is None or sep_id is None:
+        raise ValueError("Tokenizer is missing cls_token_id or sep_token_id")
+    effective_window_size = window_size - 2
+    encoded = tokenizer(code, add_special_tokens=False, truncation=False, return_tensors=None)
+    input_ids = encoded.get("input_ids", [])
+    tok_len = len(input_ids)
+    if tok_len == 0:
+        one = [cls_id, sep_id]
+        return [one], 0
+    if tok_len <= window_size:
+        content = input_ids[:effective_window_size]
+        one = [cls_id] + content + [sep_id]
+        return [one], tok_len
+    windows = []
+    seen_end = 0
+    for start in range(0, tok_len, stride):
+        chunk = input_ids[start:start + effective_window_size]
+        if not chunk:
+            break
+        if len(chunk) < effective_window_size and start + len(chunk) <= seen_end:
+            break
+        seen_end = start + len(chunk)
+        window_ids = [cls_id] + chunk + [sep_id]
+        windows.append(window_ids)
+    if not windows:
+        content = input_ids[:effective_window_size]
+        one = [cls_id] + content + [sep_id]
+        return [one], tok_len
+    if max_windows is not None and len(windows) > max_windows:
+        # Keep first, last, and evenly spaced middle
+        indices = [0]
+        if max_windows > 2:
+            middle = np.linspace(1, len(windows) - 2, max_windows - 2, dtype=int)
+            indices.extend(middle.tolist())
+        indices.append(len(windows) - 1)
+        indices = sorted(set(indices))[:max_windows]
+        windows = [windows[i] for i in indices]
+    return windows, tok_len
+
+
+def expand_training_with_windows(df, tokenizer, window_size, stride, mode="all", max_windows_per_sample=8):
+    """
+    Expand each training sample into multiple window rows. Each window inherits the original label.
+    Output columns: code, label, orig_id, window_id, num_windows_for_sample, tok_len.
+    """
     expanded_rows = []
-    
-    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Applying multi-view cropping"):
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Applying sliding-window expansion"):
         code = row["code"]
         label = row["label"]
         tok_len = row.get("tok_len", 0)
-        
-        # Tokenize to get actual token IDs
-        tokens = tokenizer(code, add_special_tokens=False, truncation=False, return_tensors=None)
-        input_ids = tokens["input_ids"]
-        actual_tok_len = len(input_ids)
-        
-        # Determine if we need middle crop
-        label_name_map = {
-            HUMAN_LABEL_ID: "human",
-            MACHINE_LABEL_ID: "machine",
-            HYBRID_LABEL_ID: "hybrid",
-            ADV_LABEL_ID: "adversarial"
-        }
-        label_name = label_name_map.get(label, "").lower()
-        use_middle = (crop_strategy == "start_end_middle" and
-                      label_name in [x.lower() for x in middle_crop_for] and
-                      actual_tok_len > max_length)
-        
-        if actual_tok_len <= max_length:
-            # Single view
+        max_w = max_windows_per_sample if mode == "capped" else None
+        windows, actual_tok_len = generate_sliding_windows(code, tokenizer, window_size, stride, max_windows=max_w)
+        if mode == "random_sample" and len(windows) > max_windows_per_sample:
+            rng = np.random.RandomState(42 + idx % 100000)
+            indices = rng.choice(len(windows), size=max_windows_per_sample, replace=False)
+            indices.sort()
+            windows = [windows[i] for i in indices]
+        for w_id, window_ids in enumerate(windows):
+            window_text = tokenizer.decode(window_ids, skip_special_tokens=False)
             expanded_rows.append({
-                'code': code,
+                'code': window_text,
                 'label': label,
-                'view': 'single',
-                'orig_id': idx
+                'orig_id': idx,
+                'window_id': w_id,
+                'num_windows_for_sample': len(windows),
+                'tok_len': actual_tok_len
             })
-        else:
-            # Start crop
-            start_tokens = input_ids[:max_length]
-            start_code = tokenizer.decode(start_tokens, skip_special_tokens=False)
-            expanded_rows.append({
-                'code': start_code,
-                'label': label,
-                'view': 'start',
-                'orig_id': idx
-            })
-            
-            # End crop
-            end_tokens = input_ids[-max_length:]
-            end_code = tokenizer.decode(end_tokens, skip_special_tokens=False)
-            expanded_rows.append({
-                'code': end_code,
-                'label': label,
-                'view': 'end',
-                'orig_id': idx
-            })
-            
-            # Optional middle crop
-            if use_middle:
-                middle_start = (actual_tok_len - max_length) // 2
-                middle_tokens = input_ids[middle_start:middle_start + max_length]
-                middle_code = tokenizer.decode(middle_tokens, skip_special_tokens=False)
-                expanded_rows.append({
-                    'code': middle_code,
-                    'label': label,
-                    'view': 'middle',
-                    'orig_id': idx
-                })
-    
     return pd.DataFrame(expanded_rows)
+
+
+def summarize_window_stats(window_counts):
+    """Lightweight: print mean / median / max / percentiles of window counts."""
+    if not window_counts:
+        return
+    arr = np.array(window_counts)
+    print(f"   Windows per sample: mean={np.mean(arr):.1f}, median={np.median(arr):.0f}, max={np.max(arr):.0f}, "
+          f"p95={np.percentile(arr, 95):.0f}")
 
 # ==================================================
 # SECTION E — MODEL + TRAINER (4 CLASS)
@@ -789,23 +809,26 @@ print(f"Model: {MODEL_NAME}")
 print(f"Device: {device}")
 print(f"Number of labels: {NUM_LABELS} (Human={HUMAN_LABEL_ID}, Machine={MACHINE_LABEL_ID}, Hybrid={HYBRID_LABEL_ID}, Adversarial={ADV_LABEL_ID})")
 
-# Apply multi-view cropping to training data
+# Apply sliding-window expansion to training data
 print("\n" + "="*70)
-print("APPLYING MULTI-VIEW CROPPING TO TRAINING DATA")
+print("APPLYING SLIDING-WINDOW EXPANSION TO TRAINING DATA")
 print("="*70)
-train_df_expanded = tokenize_and_crop(
+train_df_expanded = expand_training_with_windows(
     train_df,
     tokenizer,
-    MAX_LENGTH,
-    crop_strategy=CROP_STRATEGY,
-    middle_crop_for=MIDDLE_CROP_FOR)
+    WINDOW_SIZE,
+    WINDOW_STRIDE,
+    mode=TRAIN_WINDOW_MODE,
+    max_windows_per_sample=MAX_TRAIN_WINDOWS_PER_SAMPLE)
 
 print(f"Original training samples: {len(train_df)}")
-print(f"After multi-view expansion: {len(train_df_expanded)}")
-print("\nView distribution:")
-print(train_df_expanded["view"].value_counts())
+print(f"After sliding-window expansion: {len(train_df_expanded)}")
+window_counts_per_sample = train_df_expanded.groupby("orig_id")["window_id"].max() + 1
+print("\nWindow count per sample (first 20):")
+print(window_counts_per_sample.head(20).tolist())
+summarize_window_stats(window_counts_per_sample.tolist())
 
-# Compute class weights AFTER multi-view expansion
+# Compute class weights AFTER sliding-window expansion
 unique_labels = np.array(sorted(train_df_expanded["label"].unique()))
 class_weights_array = compute_class_weight(
     'balanced',
@@ -819,8 +842,7 @@ def tokenize_function(examples):
     return tokenizer(
         examples['code'],
         truncation=True,
-        max_length=MAX_LENGTH
-        # NO padding, NO return_tensors
+        max_length=WINDOW_SIZE
     )
 
 # Prepare datasets
@@ -1033,63 +1055,91 @@ if epoch_time_callback.epoch_times:
 print("Training completed!")
 
 # ==================================================
-# SECTION F — MULTI-VIEW INFERENCE FUNCTIONS
+# SECTION F — SLIDING-WINDOW INFERENCE
 # ==================================================
 
 @torch.no_grad()
-def predict_multiview(code, model, tokenizer, max_length, device):
+def predict_sliding_window(code, model, tokenizer, window_size, stride, device,
+                           max_windows=None, pooling_mode="mean_with_adv_max"):
     """
-    Run multi-view inference on a single code snippet.
-    
-    For short code (tok_len <= MAX_LENGTH): single forward pass
-    For long code (tok_len > MAX_LENGTH): start + end crops
-    
-    Returns aggregated logits (4-class).
+    Run inference on all sliding windows of a snippet. Returns aggregated logits [NUM_LABELS] and metadata dict.
     """
-    # Tokenize without truncation
-    tokens = tokenizer(code, add_special_tokens=False, truncation=False, return_tensors=None)
-    input_ids = tokens["input_ids"]
-    tok_len = len(input_ids)
-    
-    if tok_len == 0:
-        # Empty code - return uniform logits
-        return torch.zeros(NUM_LABELS).to(device)
-    
-    if tok_len <= max_length:
-        # Single view
-        encoded = tokenizer(code, truncation=True, max_length=max_length, return_tensors="pt")
-        encoded = {k: v.to(device) for k, v in encoded.items()}
-        outputs = model(**encoded)
-        logits = outputs.logits[0]  # [NUM_LABELS]
-        return logits
+    windows, tok_len = generate_sliding_windows(code, tokenizer, window_size, stride, max_windows=max_windows)
+    if not windows:
+        return torch.zeros(NUM_LABELS).to(device), {"tok_len": 0, "num_windows": 0}
+    # Pad and batch
+    max_len = max(len(w) for w in windows)
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    padded = [w + [pad_id] * (max_len - len(w)) for w in windows]
+    input_ids = torch.tensor(padded, dtype=torch.long).to(device)
+    attention_mask = (input_ids != pad_id).long()
+    batch_size = input_ids.size(0)
+    all_logits = []
+    eval_batch = PER_DEVICE_EVAL_BATCH
+    for start in range(0, batch_size, eval_batch):
+        end = min(start + eval_batch, batch_size)
+        out = model(input_ids=input_ids[start:end], attention_mask=attention_mask[start:end])
+        all_logits.append(out.logits)
+    logits = torch.cat(all_logits, dim=0)  # [num_windows, NUM_LABELS]
+    # Pooling
+    if pooling_mode == "mean":
+        final_logits = logits.mean(dim=0)
+    elif pooling_mode == "max":
+        final_logits = logits.max(dim=0)[0]
+    else:  # mean_with_adv_max
+        final_logits = logits.mean(dim=0).clone()
+        final_logits[ADV_LABEL_ID] = logits[:, ADV_LABEL_ID].max()
+    metadata = {"tok_len": tok_len, "num_windows": len(windows)}
+    return final_logits, metadata
+
+
+def _gated_quick_logits(code, model, tokenizer, window_size, device):
+    """First and last window only; returns (logits, tok_len)."""
+    windows, tok_len = generate_sliding_windows(code, tokenizer, window_size, window_size, max_windows=None)
+    if len(windows) < 2:
+        full_logits, meta = predict_sliding_window(code, model, tokenizer, window_size, WINDOW_STRIDE, device, max_windows=None, pooling_mode=POOLING_MODE)
+        return full_logits, meta["tok_len"]
+    windows = [windows[0], windows[-1]]
+    pad_id = tokenizer.pad_token_id or 0
+    max_len = max(len(w) for w in windows)
+    padded = [w + [pad_id] * (max_len - len(w)) for w in windows]
+    input_ids = torch.tensor(padded, dtype=torch.long).to(device)
+    attention_mask = (input_ids != pad_id).long()
+    out = model(input_ids=input_ids, attention_mask=attention_mask)
+    logits = out.logits
+    if POOLING_MODE == "mean_with_adv_max":
+        final = logits.mean(dim=0).clone()
+        final[ADV_LABEL_ID] = logits[:, ADV_LABEL_ID].max()
+    elif POOLING_MODE == "max":
+        final = logits.max(dim=0)[0]
     else:
-        # Multi-view: start + end
-        # Start crop
-        start_tokens = input_ids[:max_length]
-        start_code = tokenizer.decode(start_tokens, skip_special_tokens=False)
-        encoded_start = tokenizer(start_code, truncation=True, max_length=max_length, return_tensors="pt")
-        encoded_start = {k: v.to(device) for k, v in encoded_start.items()}
-        outputs_start = model(**encoded_start)
-        logits_start = outputs_start.logits[0]  # [NUM_LABELS]
-        
-        # End crop
-        end_tokens = input_ids[-max_length:]
-        end_code = tokenizer.decode(end_tokens, skip_special_tokens=False)
-        encoded_end = tokenizer(end_code, truncation=True, max_length=max_length, return_tensors="pt")
-        encoded_end = {k: v.to(device) for k, v in encoded_end.items()}
-        outputs_end = model(**encoded_end)
-        logits_end = outputs_end.logits[0]  # [NUM_LABELS]
-        
-        # Aggregate: mean(logits)
-        # Optional: adv boost (max of start_adv, end_adv)
-        aggregated_logits = (logits_start + logits_end) / 2.0
-        
-        # Optional adversarial boost
-        adv_logit_start = logits_start[ADV_LABEL_ID]
-        adv_logit_end = logits_end[ADV_LABEL_ID]
-        aggregated_logits[ADV_LABEL_ID] = torch.max(adv_logit_start, adv_logit_end)
-        
-        return aggregated_logits
+        final = logits.mean(dim=0)
+    return final, tok_len
+
+
+@torch.no_grad()
+def predict_sliding_window_maybe_gated(code, model, tokenizer, device, tok_len=0):
+    """Single entry point: gated or full sliding-window inference."""
+    if not USE_GATED_INFERENCE:
+        logits, meta = predict_sliding_window(
+            code, model, tokenizer, WINDOW_SIZE, WINDOW_STRIDE, device,
+            max_windows=MAX_INFER_WINDOWS_PER_SAMPLE, pooling_mode=POOLING_MODE)
+        return logits, meta
+    # Gated: quick pass first
+    quick_logits, actual_tok_len = _gated_quick_logits(code, model, tokenizer, WINDOW_SIZE, device)
+    probs = torch.softmax(quick_logits, dim=-1).cpu().numpy()
+    max_conf = float(np.max(probs))
+    pred = int(np.argmax(probs))
+    run_full = (max_conf < GATE_CONF_THRESHOLD or
+                pred in GATE_TRIGGER_LABELS or
+                (GATE_TRIGGER_LONG_ONLY and actual_tok_len > WINDOW_SIZE * 2))
+    if run_full:
+        logits, meta = predict_sliding_window(
+            code, model, tokenizer, WINDOW_SIZE, WINDOW_STRIDE, device,
+            max_windows=MAX_INFER_WINDOWS_PER_SAMPLE, pooling_mode=POOLING_MODE)
+        return logits, meta
+    meta = {"tok_len": actual_tok_len, "num_windows": 2}
+    return quick_logits, meta
 
 # ==================================================
 # SECTION G — HARD NEGATIVE MINING (DISABLED WITH EARLY STOPPING)
@@ -1113,176 +1163,121 @@ else:
         print("Early stopping provides automatic regularization.")
 
 # ==================================================
-# SECTION H — MANUAL EVALUATION (MULTI-VIEW AWARE)
+# SECTION H — MANUAL EVALUATION (SLIDING-WINDOW)
 # ==================================================
 
-def evaluate_4class_multiview(val_df, model, tokenizer, device, save_mistakes=True, mistakes_n=200, mistakes_csv_path=None, save_inference=False, inference_csv_path=None):
+def evaluate_4class_sliding_window(val_df, model, tokenizer, device, save_mistakes=True, mistakes_n=200, mistakes_csv_path=None,save_inference=False, inference_csv_path=None):
     """
-    Evaluate on validation set with multi-view inference aggregation.
-    mistakes_csv_path: if save_mistakes is True, write mistakes here; default "validation_mistakes.csv".
+    Evaluate snippet-level performance using sliding-window inference.
     save_inference: if True, save all inference results to CSV
     inference_csv_path: if save_inference is True, write all inference results here
     """
     model.eval()
-    
     predictions_4class = []
     true_labels = []
-    all_stats = []  # For error analysis
-    inference_times = []  # Track per-snippet inference latency
-    
+    all_stats = []
+    inference_times = []
+    window_counts_list = []
     start_time = time.time()
-    
     print("\n" + "="*70)
-    print("RUNNING MULTI-VIEW INFERENCE ON VALIDATION SET")
+    print("RUNNING SLIDING-WINDOW INFERENCE ON VALIDATION SET")
     print("="*70)
-    
     for idx, row in tqdm(val_df.iterrows(), total=len(val_df), desc="Evaluating"):
         code = row["code"]
         true_label = row["label"]
         tok_len = row.get("tok_len", 0)
-        
-        # Track inference latency for this snippet
         inference_start = time.time()
-        
-        # Run multi-view inference
-        logits = predict_multiview(code, model, tokenizer, MAX_LENGTH, device)
+        logits, meta = predict_sliding_window_maybe_gated(code, model, tokenizer, device, tok_len=tok_len)
         probs = torch.softmax(logits, dim=-1).cpu().numpy()
         pred_4class = int(np.argmax(probs))
-        
         inference_time = time.time() - inference_start
         inference_times.append(inference_time)
-        
+        num_w = meta.get("num_windows", 0)
+        window_counts_list.append(num_w)
         predictions_4class.append(pred_4class)
         true_labels.append(true_label)
-        
-        # Store stats for error analysis
         all_stats.append({
-            'idx': idx,
-            'true_label': true_label,
-            'pred_label': pred_4class,
-            'probs': probs.tolist(),
-            'max_prob': float(np.max(probs)),
-            'tok_len': tok_len,
+            'idx': idx, 'true_label': true_label, 'pred_label': pred_4class,
+            'probs': probs.tolist(), 'max_prob': float(np.max(probs)),
+            'tok_len': meta.get("tok_len", tok_len), 'num_windows': num_w,
             'code_preview': code[:200] if code else ""
         })
-    
     elapsed = time.time() - start_time
-    
-    # Compute metrics
     predictions_4class = np.array(predictions_4class)
     true_labels = np.array(true_labels)
-    
-    # Macro F1 (primary metric)
     macro_f1 = f1_score(true_labels, predictions_4class, average='macro', zero_division=0)
-    
-    # Per-class F1
     unique_labels = sorted(np.unique(np.concatenate([true_labels, predictions_4class])))
     per_class_f1 = f1_score(true_labels, predictions_4class, labels=unique_labels, average=None, zero_division=0)
-    
-    # Confusion matrix
     cm = confusion_matrix(true_labels, predictions_4class, labels=unique_labels)
-    
-    # Classification report
-    label_names = {
-        HUMAN_LABEL_ID: "Human",
-        MACHINE_LABEL_ID: "Machine",
-        HYBRID_LABEL_ID: "Hybrid",
-        ADV_LABEL_ID: "Adversarial"
-    }
-    target_names = [label_names.get(label, f"Class_{label}") for label in unique_labels]
-    report = classification_report(true_labels, predictions_4class, labels=unique_labels,
-                                   target_names=target_names, zero_division=0)
-    
-    # Print results
+    label_names = {HUMAN_LABEL_ID: "Human", MACHINE_LABEL_ID: "Machine", HYBRID_LABEL_ID: "Hybrid", ADV_LABEL_ID: "Adversarial"}
+    target_names = [label_names.get(l, f"Class_{l}") for l in unique_labels]
+    report = classification_report(true_labels, predictions_4class, labels=unique_labels, target_names=target_names, zero_division=0)
     print("\n" + "="*70)
     print("SNIPPET-LEVEL EVALUATION RESULTS (4-CLASS)")
     print("="*70)
     print(f"\nMacro F1 (Primary): {macro_f1:.4f}")
     print(f"\nPer-class F1 Scores:")
     for i, label in enumerate(unique_labels):
-        label_name = label_names.get(label, f"Class_{label}")
-        print(f"   {label_name} ({label}): {per_class_f1[i]:.4f}")
-    
+        print(f"   {label_names.get(label, f'Class_{label}')} ({label}): {per_class_f1[i]:.4f}")
     print(f"\nConfusion Matrix:")
     print("Actual \\ Predicted ->", end="")
     for label in unique_labels:
         print(f"{label:>8}", end="")
     print()
     for i, label in enumerate(unique_labels):
-        label_name = label_names.get(label, f"Class_{label}")
-        print(f"{label_name:15s}", end="")
+        print(f"{label_names.get(label, f'Class_{label}'):15s}", end="")
         for j in range(len(unique_labels)):
             print(f"{cm[i][j]:>8}", end="")
         print()
-    
     print(f"\nClassification Report:")
     print(report)
-    
-    # F1 by length buckets (if enabled) - matches subset creation buckets
     if REPORT_LENGTH_BUCKETS:
         print(f"\nMacro F1 by Length Buckets (matching subset creation):")
-        
-        # Get max token length to determine number of buckets
         max_tok_len = max([s['tok_len'] for s in all_stats]) if all_stats else 0
-        
-        # Create buckets matching subset creation: <=512 (short), then [512, 1024), [1024, 1536), etc.
         bucket_start = 512
         bucket_size = 512
-        
-        # Short bucket: <=512
-        length_buckets = [(-1, 512)]  # Use -1 as lower bound to include 0-512
-        
-        # Long buckets: [512, 1024), [1024, 1536), [1536, 2048), etc.
+        length_buckets = [(-1, 512)]
         num_buckets = int(np.ceil((max_tok_len - bucket_start) / bucket_size)) if max_tok_len > bucket_start else 0
         for i in range(num_buckets):
-            bucket_low = bucket_start + i * bucket_size
-            bucket_high = bucket_start + (i + 1) * bucket_size
-            length_buckets.append((bucket_low, bucket_high))
-        
-        # Add final catch-all bucket if needed
+            length_buckets.append((bucket_start + i * bucket_size, bucket_start + (i + 1) * bucket_size))
         if max_tok_len > bucket_start + num_buckets * bucket_size:
             length_buckets.append((bucket_start + num_buckets * bucket_size, float('inf')))
-        
         for low, high in length_buckets:
             mask = np.array([s['tok_len'] for s in all_stats])
-            if low == -1:  # Short bucket: <=512
+            if low == -1:
                 mask = (mask <= high)
-                bucket_label = f"<=512"
+                bucket_label = "<=512"
             elif high == float('inf'):
                 mask = (mask >= low)
                 bucket_label = f">={low}+"
             else:
-                mask = (mask >= low) & (mask < high)  # Use < for upper bound to match subset creation
+                mask = (mask >= low) & (mask < high)
                 bucket_label = f"[{low}, {high})"
-            
             if mask.sum() > 0:
-                bucket_true = true_labels[mask]
-                bucket_pred = predictions_4class[mask]
-                bucket_f1 = f1_score(bucket_true, bucket_pred, average='macro', zero_division=0)
-                print(f"   {bucket_label} tokens: {bucket_f1:.4f} (n={mask.sum()})")
-    
-    # Runtime stats
+                bucket_f1 = f1_score(true_labels[mask], predictions_4class[mask], average='macro', zero_division=0)
+                avg_w = np.mean([all_stats[i]['num_windows'] for i in np.where(mask)[0]]) if mask.sum() else 0
+                print(f"   {bucket_label} tokens: {bucket_f1:.4f} (n={mask.sum()}, avg_windows={avg_w:.1f})")
     print(f"\nRuntime Stats:")
     print(f"   Total snippets: {len(val_df)}")
     print(f"   Total time: {elapsed:.2f}s ({elapsed/60:.2f} minutes)")
     print(f"   Throughput: {len(val_df)/elapsed:.2f} snippets/sec")
-    
-    # Inference latency statistics
+    if window_counts_list:
+        print(f"   Avg windows/sample: {np.mean(window_counts_list):.1f}, Max windows/sample: {np.max(window_counts_list):.0f}")
     if inference_times:
         avg_inference_time = np.mean(inference_times)
         median_inference_time = np.median(inference_times)
         min_inference_time = np.min(inference_times)
         max_inference_time = np.max(inference_times)
         std_inference_time = np.std(inference_times)
-        
         print(f"\nInference Latency (per snippet):")
         print(f"   Average: {avg_inference_time*1000:.2f}ms ({avg_inference_time:.4f}s)")
         print(f"   Median: {median_inference_time*1000:.2f}ms ({median_inference_time:.4f}s)")
         print(f"   Min: {min_inference_time*1000:.2f}ms ({min_inference_time:.4f}s)")
         print(f"   Max: {max_inference_time*1000:.2f}ms ({max_inference_time:.4f}s)")
         print(f"   Std Dev: {std_inference_time*1000:.2f}ms ({std_inference_time:.4f}s)")
-    
-    # Save all inference results
+    summarize_window_stats(window_counts_list)
+
+      # Save all inference results
     if save_inference:
         inference_df = pd.DataFrame(all_stats)
         out_path = inference_csv_path if inference_csv_path is not None else os.path.join(OUTPUT_DIR, "inference_results.csv")
@@ -1290,42 +1285,31 @@ def evaluate_4class_multiview(val_df, model, tokenizer, device, save_mistakes=Tr
         print(f"\nSaved all inference results to {out_path} ({len(inference_df)} samples)")
     else:
         inference_df = None
-    
-    # Save hardest mistakes
+
+
     if save_mistakes:
-        mistakes = []
-        for stat in all_stats:
-            if stat['true_label'] != stat['pred_label']:
-                mistakes.append(stat)
-        
-        # Sort by confidence (lower confidence = harder mistake)
+        mistakes = [s for s in all_stats if s['true_label'] != s['pred_label']]
         mistakes.sort(key=lambda x: x['max_prob'])
-        
         if mistakes:
             mistakes_df = pd.DataFrame(mistakes[:mistakes_n])
             out_path = mistakes_csv_path if mistakes_csv_path is not None else os.path.join(OUTPUT_DIR, "validation_mistakes.csv")
             mistakes_df.to_csv(out_path, index=False)
-            print(f"Saved {len(mistakes_df)} hardest mistakes to {out_path}")
+            print(f"\nSaved {len(mistakes_df)} hardest mistakes to {out_path}")
         else:
             mistakes_df = None
     else:
         mistakes_df = None
-
     return {
-        'macro_f1': macro_f1,
-        'per_class_f1': dict(zip(unique_labels, per_class_f1)),
-        'confusion_matrix': cm,
-        'predictions': predictions_4class,
-        'true_labels': true_labels,
-        'all_stats': all_stats,
-        'mistakes_df': mistakes_df if save_mistakes else None
+        'macro_f1': macro_f1, 'per_class_f1': dict(zip(unique_labels, per_class_f1)),
+        'confusion_matrix': cm, 'predictions': predictions_4class, 'true_labels': true_labels,
+        'all_stats': all_stats, 'mistakes_df': mistakes_df if save_mistakes else None
     }
 
 # Run evaluation on validation set
 print("\n" + "="*70)
 print(f"FINAL VALIDATION EVALUATION ({len(val_df):,} samples)")
 print("="*70)
-eval_results = evaluate_4class_multiview(
+eval_results = evaluate_4class_sliding_window(
     val_df,
     model,
     tokenizer,
@@ -1340,7 +1324,7 @@ eval_results = evaluate_4class_multiview(
 print("\n" + "="*70)
 print(f"FINAL TEST SET EVALUATION ({len(test_df):,} samples)")
 print("="*70)
-evaluate_4class_multiview(
+evaluate_4class_sliding_window(
     test_df,
     model,
     tokenizer,
@@ -1351,51 +1335,41 @@ evaluate_4class_multiview(
     save_inference=SAVE_INFERENCE,
     inference_csv_path=os.path.join(OUTPUT_DIR, "test_inference.csv"))
 
+
 # ==================================================
-# SECTION I — TEST PREDICTION + SUBMISSION (LOCAL VERSION)
+# SECTION I — TEST PREDICTION + SUBMISSION (SLIDING-WINDOW)
 # ==================================================
 
 def predict_test_and_write_submission(test_parquet_path, output_csv_path, model, tokenizer, device):
     """
-    Stream test set, run multi-view inference, write 4-class predictions to submission.
-    LOCAL VERSION: Uses local file paths
+    Stream test set, run sliding-window inference, write 4-class predictions to submission.
     """
     model.eval()
-    
-    # Check if test file exists
     if not os.path.exists(test_parquet_path):
         print(f"❌ Test file not found: {test_parquet_path}")
-        print("Please ensure the test file is in the current directory.")
         return
-    
-    # Load test data
     try:
         test_df = pd.read_parquet(test_parquet_path)
         print(f"✅ Loaded test data: {len(test_df)} samples")
     except Exception as e:
         print(f"❌ Error loading test file: {e}")
         return
-    
+    if TEST_PREDICT_MAX_SAMPLES is not None and len(test_df) > TEST_PREDICT_MAX_SAMPLES:
+        test_df = test_df.head(TEST_PREDICT_MAX_SAMPLES).copy()
+        print(f"[QUICK TEST] Predicting on first {len(test_df):,} samples only (full set would be 500k+)")
     print("\n" + "="*70)
     print("PREDICTING ON TEST SET")
     print("="*70)
-    
     with open(output_csv_path, "w") as f:
         f.write("ID,prediction\n")
-        
         count = 0
         for idx, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Predicting"):
             code = row["code"]
             ex_id = row["ID"]
-            
-            # Run multi-view inference
-            logits = predict_multiview(code, model, tokenizer, MAX_LENGTH, device)
+            logits, _ = predict_sliding_window_maybe_gated(code, model, tokenizer, device)
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
             pred_4class = int(np.argmax(probs))
-            
-            # Write to CSV
             f.write(f"{ex_id},{pred_4class}\n")
-            
             count += 1
             if count % 1000 == 0:
                 print(f"Processed {count} samples...")

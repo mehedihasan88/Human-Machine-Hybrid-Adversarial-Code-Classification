@@ -1,0 +1,24 @@
+# PyTorch ecosystem
+torch>=1.9.0
+transformers>=4.20.0
+datasets>=2.0.0
+
+# Data processing
+pandas>=1.3.0
+numpy>=1.21.0
+
+# Machine learning utilities
+scikit-learn>=1.0.0
+
+# Progress bars
+tqdm>=4.62.0
+
+# Optional: For GPU support (install based on your CUDA version)
+# torch-audio  # Uncomment if needed
+# torchvision   # Uncomment if needed
+
+# For parquet file support
+pyarrow>=6.0.0
+
+# Additional utilities
+python-dateutil>=2.8.0

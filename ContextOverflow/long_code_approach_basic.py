@@ -106,6 +106,7 @@ NUM_LABELS = 4
 
 # Token 
 MAX_LENGTH = 512
+USE_MULTIVIEW = False                      # Enable/disable multi-view cropping
 CROP_STRATEGY = "start_end_middle"        # options: start_only | start_end | start_end_middle
 MIDDLE_CROP_FOR = ["hybrid", "adversarial"]
 RANDOM_CROP_SEED = 123
@@ -693,12 +694,13 @@ print("\n" + "="*70)
 # SECTION D — MULTI-VIEW CROPPING (NO WINDOWS)
 # ==================================================
 
-def tokenize_and_crop(df, tokenizer, max_length, crop_strategy="start_end", middle_crop_for=None):
+def tokenize_and_crop(df, tokenizer, max_length, use_multiview=True, crop_strategy="start_end", middle_crop_for=None):
     """
     Apply multi-view cropping to create training rows.
     
+    If use_multiview is False: no cropping, use original code as-is
     If tok_len <= MAX_LENGTH: single view
-    If tok_len > MAX_LENGTH:
+    If tok_len > MAX_LENGTH and use_multiview is True:
         - start crop (first MAX_LENGTH tokens)
         - end crop (last MAX_LENGTH tokens)
         - optional middle crop ONLY for specified labels if crop_strategy == start_end_middle
@@ -709,10 +711,20 @@ def tokenize_and_crop(df, tokenizer, max_length, crop_strategy="start_end", midd
     
     expanded_rows = []
     
-    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Applying multi-view cropping"):
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Tokenizing and cropping"):
         code = row["code"]
         label = row["label"]
         tok_len = row.get("tok_len", 0)
+        
+        # If multiview is disabled, use code as-is (no cropping)
+        if not use_multiview:
+            expanded_rows.append({
+                'code': code,
+                'label': label,
+                'view': 'single',
+                'orig_id': idx
+            })
+            continue
         
         # Tokenize to get actual token IDs
         tokens = tokenizer(code, add_special_tokens=False, truncation=False, return_tensors=None)
@@ -791,12 +803,16 @@ print(f"Number of labels: {NUM_LABELS} (Human={HUMAN_LABEL_ID}, Machine={MACHINE
 
 # Apply multi-view cropping to training data
 print("\n" + "="*70)
-print("APPLYING MULTI-VIEW CROPPING TO TRAINING DATA")
+if USE_MULTIVIEW:
+    print(f"APPLYING MULTI-VIEW CROPPING TO TRAINING DATA (enabled)")
+else:
+    print(f"APPLYING TOKENIZATION TO TRAINING DATA (multiview disabled)")
 print("="*70)
 train_df_expanded = tokenize_and_crop(
     train_df,
     tokenizer,
     MAX_LENGTH,
+    use_multiview=USE_MULTIVIEW,
     crop_strategy=CROP_STRATEGY,
     middle_crop_for=MIDDLE_CROP_FOR)
 
@@ -1037,12 +1053,14 @@ print("Training completed!")
 # ==================================================
 
 @torch.no_grad()
-def predict_multiview(code, model, tokenizer, max_length, device):
+def predict_multiview(code, model, tokenizer, max_length, device, use_multiview=True):
     """
-    Run multi-view inference on a single code snippet.
+    Run inference on a single code snippet.
     
-    For short code (tok_len <= MAX_LENGTH): single forward pass
-    For long code (tok_len > MAX_LENGTH): start + end crops
+    If use_multiview is False: single forward pass (truncate if needed)
+    If use_multiview is True:
+        - For short code (tok_len <= MAX_LENGTH): single forward pass
+        - For long code (tok_len > MAX_LENGTH): start + end crops
     
     Returns aggregated logits (4-class).
     """
@@ -1055,6 +1073,15 @@ def predict_multiview(code, model, tokenizer, max_length, device):
         # Empty code - return uniform logits
         return torch.zeros(NUM_LABELS).to(device)
     
+    # If multiview is disabled, use simple truncation
+    if not use_multiview:
+        encoded = tokenizer(code, truncation=True, max_length=max_length, return_tensors="pt")
+        encoded = {k: v.to(device) for k, v in encoded.items()}
+        outputs = model(**encoded)
+        logits = outputs.logits[0]  # [NUM_LABELS]
+        return logits
+    
+    # Multiview enabled
     if tok_len <= max_length:
         # Single view
         encoded = tokenizer(code, truncation=True, max_length=max_length, return_tensors="pt")
@@ -1116,12 +1143,13 @@ else:
 # SECTION H — MANUAL EVALUATION (MULTI-VIEW AWARE)
 # ==================================================
 
-def evaluate_4class_multiview(val_df, model, tokenizer, device, save_mistakes=True, mistakes_n=200, mistakes_csv_path=None, save_inference=False, inference_csv_path=None):
+def evaluate_4class_multiview(val_df, model, tokenizer, device, save_mistakes=True, mistakes_n=200, mistakes_csv_path=None, save_inference=False, inference_csv_path=None, use_multiview=True):
     """
     Evaluate on validation set with multi-view inference aggregation.
     mistakes_csv_path: if save_mistakes is True, write mistakes here; default "validation_mistakes.csv".
     save_inference: if True, save all inference results to CSV
     inference_csv_path: if save_inference is True, write all inference results here
+    use_multiview: enable/disable multi-view inference
     """
     model.eval()
     
@@ -1133,7 +1161,10 @@ def evaluate_4class_multiview(val_df, model, tokenizer, device, save_mistakes=Tr
     start_time = time.time()
     
     print("\n" + "="*70)
-    print("RUNNING MULTI-VIEW INFERENCE ON VALIDATION SET")
+    if use_multiview:
+        print("RUNNING MULTI-VIEW INFERENCE ON VALIDATION SET (enabled)")
+    else:
+        print("RUNNING INFERENCE ON VALIDATION SET (multiview disabled)")
     print("="*70)
     
     for idx, row in tqdm(val_df.iterrows(), total=len(val_df), desc="Evaluating"):
@@ -1144,8 +1175,8 @@ def evaluate_4class_multiview(val_df, model, tokenizer, device, save_mistakes=Tr
         # Track inference latency for this snippet
         inference_start = time.time()
         
-        # Run multi-view inference
-        logits = predict_multiview(code, model, tokenizer, MAX_LENGTH, device)
+        # Run inference with or without multiview
+        logits = predict_multiview(code, model, tokenizer, MAX_LENGTH, device, use_multiview=use_multiview)
         probs = torch.softmax(logits, dim=-1).cpu().numpy()
         pred_4class = int(np.argmax(probs))
         
@@ -1334,7 +1365,8 @@ eval_results = evaluate_4class_multiview(
     mistakes_n=MISTAKES_N,
     mistakes_csv_path=os.path.join(OUTPUT_DIR, "validation_mistakes.csv"),
     save_inference=SAVE_INFERENCE,
-    inference_csv_path=os.path.join(OUTPUT_DIR, "validation_inference.csv"))
+    inference_csv_path=os.path.join(OUTPUT_DIR, "validation_inference.csv"),
+    use_multiview=USE_MULTIVIEW)
 
 # Run evaluation on held-out test set (same distribution as train)
 print("\n" + "="*70)
@@ -1349,16 +1381,18 @@ evaluate_4class_multiview(
     mistakes_n=MISTAKES_N,
     mistakes_csv_path=os.path.join(OUTPUT_DIR, "test_mistakes.csv"),
     save_inference=SAVE_INFERENCE,
-    inference_csv_path=os.path.join(OUTPUT_DIR, "test_inference.csv"))
+    inference_csv_path=os.path.join(OUTPUT_DIR, "test_inference.csv"),
+    use_multiview=USE_MULTIVIEW)
 
 # ==================================================
 # SECTION I — TEST PREDICTION + SUBMISSION (LOCAL VERSION)
 # ==================================================
 
-def predict_test_and_write_submission(test_parquet_path, output_csv_path, model, tokenizer, device):
+def predict_test_and_write_submission(test_parquet_path, output_csv_path, model, tokenizer, device, use_multiview=True):
     """
-    Stream test set, run multi-view inference, write 4-class predictions to submission.
+    Stream test set, run inference, write 4-class predictions to submission.
     LOCAL VERSION: Uses local file paths
+    use_multiview: enable/disable multi-view inference
     """
     model.eval()
     
@@ -1388,8 +1422,8 @@ def predict_test_and_write_submission(test_parquet_path, output_csv_path, model,
             code = row["code"]
             ex_id = row["ID"]
             
-            # Run multi-view inference
-            logits = predict_multiview(code, model, tokenizer, MAX_LENGTH, device)
+            # Run inference with or without multiview
+            logits = predict_multiview(code, model, tokenizer, MAX_LENGTH, device, use_multiview=use_multiview)
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
             pred_4class = int(np.argmax(probs))
             
@@ -1418,7 +1452,7 @@ def predict_test_and_write_submission(test_parquet_path, output_csv_path, model,
 
 # Generate submission file on test set (if enabled)
 if GENERATE_SUBMISSION:
-    predict_test_and_write_submission(TEST_PARQUET_PATH, SUBMISSION_OUTPUT_PATH, model, tokenizer, device)
+    predict_test_and_write_submission(TEST_PARQUET_PATH, SUBMISSION_OUTPUT_PATH, model, tokenizer, device, use_multiview=USE_MULTIVIEW)
 else:
     print("\n" + "="*70)
     print("SUBMISSION GENERATION SKIPPED")
