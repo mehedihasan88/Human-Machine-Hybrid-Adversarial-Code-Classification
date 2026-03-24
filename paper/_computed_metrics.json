@@ -1,0 +1,13 @@
+{
+  "note": "Test split metrics after correcting truncation vs multi-view filename swap (pred columns exchanged so filenames match intended models).",
+  "test_n": 33742,
+  "methods": {
+    "truncation": {"accuracy": 0.862101, "macro_f1": 0.816715},
+    "multiview": {"accuracy": 0.896450, "macro_f1": 0.859769},
+    "sliding_window": {"accuracy": 0.897398, "macro_f1": 0.862128}
+  },
+  "training_subset": {
+    "n": 201826,
+    "fraction_of_900k_train": 0.22425
+  }
+}

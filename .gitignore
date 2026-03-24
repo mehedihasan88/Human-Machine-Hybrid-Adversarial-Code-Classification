@@ -3,6 +3,9 @@
 task_c_*.parquet
 test_*.parquet
 
+# Local pip deps (e.g. pyarrow in-repo)
+_pydeps/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -34,6 +37,9 @@ wheels/
 *.swp
 *.swo
 *~
+
+# Inference CSV backups (local only)
+results/*.bak_swap
 
 # Results
 # Exclude specific result files that should be committed

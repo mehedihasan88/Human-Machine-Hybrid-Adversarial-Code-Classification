@@ -1,0 +1,144 @@
+{
+  "tokenizer": "microsoft/unixcoder-base",
+  "max_length_encoder": 512,
+  "training_subset": {
+    "n": 201826,
+    "target_n": 200000,
+    "seed": 42,
+    "policy": "20% tok_len<=512, 80% long with bucket sampling (see methodology)",
+    "label_distribution": {
+      "0": {
+        "count": 110492,
+        "pct": 54.75
+      },
+      "1": {
+        "count": 56781,
+        "pct": 28.13
+      },
+      "2": {
+        "count": 11543,
+        "pct": 5.72
+      },
+      "3": {
+        "count": 23010,
+        "pct": 11.4
+      }
+    },
+    "length_bins": {
+      "0--128": {
+        "count": 12174,
+        "pct": 6.03
+      },
+      "129--256": {
+        "count": 14160,
+        "pct": 7.02
+      },
+      "257--512": {
+        "count": 13666,
+        "pct": 6.77
+      },
+      "513--1024": {
+        "count": 106798,
+        "pct": 52.92
+      },
+      "1025+": {
+        "count": 55028,
+        "pct": 27.27
+      }
+    },
+    "short_le512": 40000,
+    "long_gt512": 161826
+  },
+  "validation_split": {
+    "source_csv": "results/validation_inference.csv",
+    "n": 33743,
+    "label_distribution": {
+      "0": {
+        "count": 14994,
+        "pct": 44.44
+      },
+      "1": {
+        "count": 10638,
+        "pct": 31.53
+      },
+      "2": {
+        "count": 3269,
+        "pct": 9.69
+      },
+      "3": {
+        "count": 4842,
+        "pct": 14.35
+      }
+    },
+    "length_bins": {
+      "0--128": {
+        "count": 2330,
+        "pct": 6.91
+      },
+      "129--256": {
+        "count": 2799,
+        "pct": 8.3
+      },
+      "257--512": {
+        "count": 2871,
+        "pct": 8.51
+      },
+      "513--1024": {
+        "count": 19546,
+        "pct": 57.93
+      },
+      "1025+": {
+        "count": 6197,
+        "pct": 18.37
+      }
+    },
+    "short_le512": 8000,
+    "long_gt512": 25743
+  },
+  "test_split": {
+    "source_csv": "results/test_inference_basic.csv",
+    "n": 33742,
+    "label_distribution": {
+      "0": {
+        "count": 14993,
+        "pct": 44.43
+      },
+      "1": {
+        "count": 10638,
+        "pct": 31.53
+      },
+      "2": {
+        "count": 3270,
+        "pct": 9.69
+      },
+      "3": {
+        "count": 4841,
+        "pct": 14.35
+      }
+    },
+    "length_bins": {
+      "0--128": {
+        "count": 2364,
+        "pct": 7.01
+      },
+      "129--256": {
+        "count": 2706,
+        "pct": 8.02
+      },
+      "257--512": {
+        "count": 2930,
+        "pct": 8.68
+      },
+      "513--1024": {
+        "count": 19564,
+        "pct": 57.98
+      },
+      "1025+": {
+        "count": 6178,
+        "pct": 18.31
+      }
+    },
+    "short_le512": 8000,
+    "long_gt512": 25742
+  }
+}
